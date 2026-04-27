@@ -641,6 +641,7 @@ class Agent:
 
         昼終了リクエストに対する処理を行う.
         """
+        self._extract_co_divine_results()
         self._send_message_to_llm(self.request)
 
     def divine(self) -> str:
@@ -651,6 +652,7 @@ class Agent:
         Returns:
             str: Agent name to divine / 占い対象のエージェント名
         """
+        self._extract_co_divine_results()
         return self._send_message_to_llm(self.request) or random.choice(  # noqa: S311
             self.get_alive_agents(),
         )
@@ -663,6 +665,7 @@ class Agent:
         Returns:
             str: Agent name to guard / 護衛対象のエージェント名
         """
+        self._extract_co_divine_results()
         return self._send_message_to_llm(self.request) or random.choice(  # noqa: S311
             self.get_alive_agents(),
         )
@@ -675,6 +678,7 @@ class Agent:
         Returns:
             str: Agent name to vote / 投票対象のエージェント名
         """
+        self._extract_co_divine_results()
         return self._send_message_to_llm(self.request) or random.choice(  # noqa: S311
             self.get_alive_agents(),
         )
@@ -687,6 +691,7 @@ class Agent:
         Returns:
             str: Agent name to attack / 襲撃対象のエージェント名
         """
+        self._extract_co_divine_results()
         return self._send_message_to_llm(self.request) or random.choice(  # noqa: S311
             self.get_alive_agents(),
         )
