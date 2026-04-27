@@ -42,7 +42,7 @@ class Seer(Agent):
         """Perform processing for daily initialization request.
 
         昼開始リクエストに対する処理を行う.
-        占い結果を蓄積してからLLMに送信する.
+        first-person の占い結果を蓄積した上で, 親クラスで CO 抽出と LLM 送信を行う.
         """
         if self.info and self.info.divine_result:
             target = self.info.divine_result.target
@@ -51,7 +51,7 @@ class Seer(Agent):
                 self.divine_results[target] = "黒(人狼)"
             else:
                 self.divine_results[target] = "白(人間)"
-        self._send_message_to_llm(self.request)
+        super().daily_initialize()
 
     def _get_template_keys(self) -> dict[str, Any]:
         """Get template keys including divine results map.

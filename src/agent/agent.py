@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import random
 from pathlib import Path
@@ -79,6 +80,11 @@ class Agent:
         self.sent_whisper_count: int = 0
         self.llm_model: BaseChatModel | None = None
         self.llm_message_history: list[BaseMessage] = []
+
+        # 占い CO マップ: {占い CO したエージェント名: {対象: "白(人間)" | "黒(人狼)"}}
+        # 全エージェントが talk_history からの抽出で蓄積し、矛盾検出に使う
+        self.co_divine_map: dict[str, dict[str, str]] = {}
+        self._last_co_scan_idx: int = 0
 
         load_dotenv(Path(__file__).parent.joinpath("./../../config/.env"))
 
@@ -162,6 +168,8 @@ class Agent:
             self.talk_history: list[Talk] = []
             self.whisper_history: list[Talk] = []
             self.llm_message_history: list[BaseMessage] = []
+            self.co_divine_map = {}
+            self._last_co_scan_idx = 0
         self.agent_logger.logger.debug(packet)
 
     def get_alive_agents(self) -> list[str]:
@@ -317,7 +325,109 @@ class Agent:
             "rope_margin": rope_margin,
             "is_first_talk_today": is_first_talk_today,
             "is_first_whisper_today": is_first_whisper_today,
+            "co_divine_map": self.co_divine_map,
         }
+
+    @staticmethod
+    def _strip_code_fence(text: str) -> str:
+        """Strip leading/trailing ``` code fence lines if present."""
+        text = text.strip()
+        if not text.startswith("```"):
+            return text
+        lines = text.split("\n")
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].startswith("```"):
+            lines = lines[:-1]
+        return "\n".join(lines)
+
+    @staticmethod
+    def _normalize_co_result(result: Any) -> str | None:  # noqa: ANN401
+        """Normalize a divine result string to '白(人間)' / '黒(人狼)' or None."""
+        if not result:
+            return None
+        s = str(result)
+        s_upper = s.upper()
+        if "黒" in s or "WEREWOLF" in s_upper or "BLACK" in s_upper:
+            return "黒(人狼)"
+        if "白" in s or "HUMAN" in s_upper or "WHITE" in s_upper:
+            return "白(人間)"
+        return None
+
+    def _apply_co_extraction_items(self, items: list[Any]) -> None:
+        """Apply parsed extraction items to co_divine_map."""
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            d = cast("dict[str, Any]", item)
+            co_seer: Any = d.get("co_seer") or d.get("seer")
+            target: Any = d.get("target")
+            result: Any = d.get("result")
+            if not co_seer or not target or result is None:
+                continue
+            normalized = self._normalize_co_result(result)
+            if normalized is None:
+                continue
+            self.co_divine_map.setdefault(str(co_seer), {})[str(target)] = normalized
+
+    def _extract_co_divine_results(self) -> None:
+        """Extract seer-CO divine claims from talk_history via LLM and update co_divine_map.
+
+        トーク履歴から占い CO の主張(誰を占って白/黒だったか)を LLM で抽出し,
+        co_divine_map に蓄積する. 全エージェントが他者の占い CO を矛盾検出のために
+        集計する用途で, 占い師自身の真の占い結果とは別に管理される(占い師の
+        first-person 結果は talk_history の CO 発言経由でこの map にも反映される).
+        """
+        if self.llm_model is None:
+            return
+        new_talks = self.talk_history[self._last_co_scan_idx :]
+        if not new_talks:
+            return
+        template = self._resolve_prompt("co_extraction")
+        if template is None:
+            return
+
+        talks_text = "\n".join(f"Day{t.day} {t.agent}: {t.text}" for t in new_talks)
+        if self.co_divine_map:
+            existing_map_text = "\n".join(
+                f"- {seer}: " + ", ".join(f"{tgt}={res}" for tgt, res in results.items())
+                for seer, results in self.co_divine_map.items()
+            )
+        else:
+            existing_map_text = "(まだなし)"
+
+        rendered = (
+            Template(template)
+            .render(
+                talks_text=talks_text,
+                existing_map_text=existing_map_text,
+                new_talks=new_talks,
+                existing_map=self.co_divine_map,
+            )
+            .strip()
+        )
+
+        try:
+            response = (self.llm_model | StrOutputParser()).invoke(
+                [HumanMessage(content=rendered)],
+            )
+        except Exception:
+            self.agent_logger.logger.exception("Failed to extract CO divine results")
+            return
+
+        # 同じ talks を二重に投げないよう、LLM 呼び出し成功時点でスキャン位置を進める
+        self._last_co_scan_idx = len(self.talk_history)
+
+        try:
+            parsed: Any = json.loads(self._strip_code_fence(response))
+        except json.JSONDecodeError:
+            self.agent_logger.logger.warning(["CO_EXTRACTION_PARSE_ERROR", response])
+            return
+        if not isinstance(parsed, list):
+            return
+
+        self._apply_co_extraction_items(cast("list[Any]", parsed))
+        self.agent_logger.logger.info(["CO_EXTRACTION", self.co_divine_map])
 
     def _get_compression_config(self) -> dict[str, Any] | None:
         """Get history compression config for the current agent count.
@@ -489,7 +599,9 @@ class Agent:
         """Perform processing for daily initialization request.
 
         昼開始リクエストに対する処理を行う.
+        前日のトーク履歴から占い CO を抽出した上で LLM へ送信する.
         """
+        self._extract_co_divine_results()
         self._send_message_to_llm(self.request)
 
     def whisper(self) -> str:
