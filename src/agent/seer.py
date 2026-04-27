@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from aiwolf_nlp_common.packet import Role
+from aiwolf_nlp_common.packet import Role, Species
 
 from agent.agent import Agent
 
@@ -36,6 +36,34 @@ class Seer(Agent):
             role (Role): Role (ignored, always set to SEER) / 役職(無視され、常にSEERに設定)
         """
         super().__init__(config, name, game_id, Role.SEER)
+        self.divine_results: dict[str, str] = {}
+
+    def daily_initialize(self) -> None:
+        """Perform processing for daily initialization request.
+
+        昼開始リクエストに対する処理を行う.
+        占い結果を蓄積してからLLMに送信する.
+        """
+        if self.info and self.info.divine_result:
+            target = self.info.divine_result.target
+            result = self.info.divine_result.result
+            if result == Species.WEREWOLF:
+                self.divine_results[target] = "黒(人狼)"
+            else:
+                self.divine_results[target] = "白(人間)"
+        self._send_message_to_llm(self.request)
+
+    def _get_template_keys(self) -> dict[str, Any]:
+        """Get template keys including divine results map.
+
+        占い結果マップを含むテンプレートキーを取得する.
+
+        Returns:
+            dict[str, Any]: Template keys / テンプレートキー
+        """
+        keys = super()._get_template_keys()
+        keys["divine_results"] = self.divine_results
+        return keys
 
     def talk(self) -> str:
         """Return response to talk request.
