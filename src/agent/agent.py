@@ -86,6 +86,10 @@ class Agent:
         self.co_divine_map: dict[str, dict[str, str]] = {}
         self._last_co_scan_idx: int = 0
 
+        # プロフィール（ペルソナ）は INITIALIZE パケットでのみ届くため、
+        # 後続パケットで失われないよう独自にキャッシュする
+        self.cached_profile: str | None = None
+
         load_dotenv(Path(__file__).parent.joinpath("./../../config/.env"))
 
     @staticmethod
@@ -148,6 +152,9 @@ class Agent:
         """
         self.request = packet.request
         if packet.info:
+            # プロフィールは INITIALIZE 時のみ含まれる仕様なので、初回受信時にキャッシュして保持する
+            if packet.info.profile is not None:
+                self.cached_profile = packet.info.profile
             self.info = packet.info
         if packet.setting:
             self.setting = packet.setting
@@ -326,6 +333,7 @@ class Agent:
             "is_first_talk_today": is_first_talk_today,
             "is_first_whisper_today": is_first_whisper_today,
             "co_divine_map": self.co_divine_map,
+            "profile": self.cached_profile,
         }
 
     @staticmethod
