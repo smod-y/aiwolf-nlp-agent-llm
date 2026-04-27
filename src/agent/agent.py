@@ -317,6 +317,31 @@ class Agent:
                 if w.day == self.info.day and w.agent == self.info.agent:
                     is_first_whisper_today = False
                     break
+        # 占い CO 結果の集計
+        # confirmed_white: 全占い CO から白判定 + 黒判定なし → 確定白（絶対吊らない）
+        # partial_white  : 一部の占い CO から白判定（確定白を除く） → 9人村全員生存時のみ吊らない
+        # black_judged   : 少なくとも 1 つの黒判定あり → 最優先で吊る
+        confirmed_white_players: list[str] = []
+        partial_white_players: list[str] = []
+        black_judged_players: list[str] = []
+        if self.co_divine_map:
+            seer_co_count = len(self.co_divine_map)
+            white_count: dict[str, int] = {}
+            black_count: dict[str, int] = {}
+            for results in self.co_divine_map.values():
+                for target, result in results.items():
+                    if "白" in result:
+                        white_count[target] = white_count.get(target, 0) + 1
+                    elif "黒" in result:
+                        black_count[target] = black_count.get(target, 0) + 1
+            for player, w in white_count.items():
+                if black_count.get(player, 0) > 0:
+                    continue
+                if w == seer_co_count:
+                    confirmed_white_players.append(player)
+                else:
+                    partial_white_players.append(player)
+            black_judged_players = list(black_count.keys())
         return {
             "info": self.info,
             "setting": self.setting,
@@ -334,6 +359,9 @@ class Agent:
             "is_first_whisper_today": is_first_whisper_today,
             "co_divine_map": self.co_divine_map,
             "profile": self.cached_profile,
+            "confirmed_white_players": confirmed_white_players,
+            "partial_white_players": partial_white_players,
+            "black_judged_players": black_judged_players,
         }
 
     @staticmethod
