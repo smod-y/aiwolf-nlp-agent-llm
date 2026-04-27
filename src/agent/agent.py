@@ -10,15 +10,17 @@ import os
 import random
 from pathlib import Path
 from time import sleep
-from typing import TYPE_CHECKING, Any, ParamSpec, TypeVar
+from typing import TYPE_CHECKING, Any, ParamSpec, TypeVar, cast
 
 from dotenv import load_dotenv
 from jinja2 import Template
-from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_core.output_parsers import StrOutputParser
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_ollama import ChatOllama
 from langchain_openai import ChatOpenAI
+
+# from langchain_anthropic import ChatAnthropic
 from pydantic import SecretStr
 
 if TYPE_CHECKING:
@@ -228,6 +230,159 @@ class Agent:
             send(text)
             await asyncio.sleep(5)
 
+    def _resolve_prompt(self, key: str, *, merge_default: bool = False) -> str | None:
+        """Resolve a prompt template by request key and role.
+
+        リクエストキーと役職からプロンプトテンプレートを解決する.
+        merge_default=False (既定): role固有 > default > 文字列そのまま(後方互換)
+        merge_default=True: default と role固有 を連結して返す（system プロンプト用）
+
+        Args:
+            key (str): Prompt config key (e.g. "talk", "system") / プロンプト設定キー
+            merge_default (bool): If True, concatenate default and role-specific
+                sections instead of choosing one / Trueなら default と役職別を連結
+
+        Returns:
+            str | None: Resolved prompt template or None / 解決されたプロンプトテンプレートまたはNone
+        """
+        prompt_config: str | dict[str, str] | None = self.config["prompt"].get(key)
+        if prompt_config is None:
+            return None
+        if isinstance(prompt_config, dict):
+            role_key = self.role.value.lower()
+            if merge_default:
+                parts: list[str] = []
+                default_part = prompt_config.get("default")
+                if default_part:
+                    parts.append(default_part)
+                role_part = prompt_config.get(role_key)
+                if role_part:
+                    parts.append(role_part)
+                return "\n\n".join(parts) if parts else None
+            return prompt_config.get(role_key) or prompt_config.get("default")
+        return prompt_config
+
+    def _get_template_keys(self) -> dict[str, Any]:
+        """Get template keys for Jinja2 rendering.
+
+        Jinja2テンプレートに渡すキーを取得する.
+        サブクラスでオーバーライドして追加のキーを提供できる.
+
+        Returns:
+            dict[str, Any]: Template keys / テンプレートキー
+        """
+        player_num = int(self.config["agent"]["num"])
+        # 役職割当の想定: 5人=人狼1, 9人=人狼2, 13人=人狼3
+        if player_num <= 5:
+            werewolf_total = 1
+        elif player_num <= 9:
+            werewolf_total = 2
+        else:
+            werewolf_total = 3
+        alive_count = 0
+        if self.info is not None:
+            alive_count = sum(
+                1 for v in self.info.status_map.values() if v == Status.ALIVE
+            )
+        # 縄余裕: 村側が 1 回ミス吊りしても勝ち筋が残るかの簡易判定
+        # alive > werewolf_total * 2 + 1 なら、ミス吊り 1 回を吸収できる
+        rope_margin = alive_count > werewolf_total * 2 + 1
+        # 残り吊り可能回数（最悪ケースで全ミスしたときに吊れる回数の最大値）
+        rope_count = max(0, (alive_count - werewolf_total) // 2)
+        # 自分のその日の最初の発話か（毎日リセットされる判定）
+        # sent_talk_count は累積オフセットで毎日リセットされないため、別途算出する
+        is_first_talk_today = True
+        is_first_whisper_today = True
+        if self.info is not None:
+            for t in self.talk_history:
+                if t.day == self.info.day and t.agent == self.info.agent:
+                    is_first_talk_today = False
+                    break
+            for w in self.whisper_history:
+                if w.day == self.info.day and w.agent == self.info.agent:
+                    is_first_whisper_today = False
+                    break
+        return {
+            "info": self.info,
+            "setting": self.setting,
+            "talk_history": self.talk_history,
+            "whisper_history": self.whisper_history,
+            "role": self.role,
+            "sent_talk_count": self.sent_talk_count,
+            "sent_whisper_count": self.sent_whisper_count,
+            "player_num": player_num,
+            "werewolf_total": werewolf_total,
+            "alive_count": alive_count,
+            "rope_count": rope_count,
+            "rope_margin": rope_margin,
+            "is_first_talk_today": is_first_talk_today,
+            "is_first_whisper_today": is_first_whisper_today,
+        }
+
+    def _get_compression_config(self) -> dict[str, Any] | None:
+        """Get history compression config for the current agent count.
+
+        現在のエージェント数に対応する履歴圧縮設定を取得する.
+
+        Returns:
+            dict[str, Any] | None: Compression config or None if disabled /
+                圧縮設定、無効の場合はNone
+        """
+        compression_configs: dict[int | str, Any] | None = self.config["llm"].get("history_compression")
+        if compression_configs is None:
+            return None
+        agent_num = int(self.config["agent"]["num"])
+        config: dict[str, Any] | None = compression_configs.get(agent_num) or compression_configs.get(
+            str(agent_num),
+        )
+        if config is None or not config.get("enabled", False):
+            return None
+        return config
+
+    def _compress_history(self) -> None:
+        """Compress old message history by summarizing with LLM.
+
+        古いメッセージ履歴をLLMで要約して圧縮する.
+        """
+        comp_config = self._get_compression_config()
+        if comp_config is None:
+            return
+        threshold = int(comp_config["threshold"])
+        keep_recent = int(comp_config["keep_recent"])
+        if len(self.llm_message_history) < threshold:
+            return
+        if self.llm_model is None:
+            return
+
+        summary_template = self.config["prompt"].get("history_summary")
+        if summary_template is None:
+            return
+
+        old_messages = self.llm_message_history[:-keep_recent]
+        recent_messages = self.llm_message_history[-keep_recent:]
+
+        msg_dicts: list[dict[str, str]] = [
+            {"type": type(m).__name__, "content": cast("str", m.content)}  # pyright: ignore[reportUnknownMemberType]
+            for m in old_messages
+        ]
+        summary_prompt = Template(summary_template).render(messages=msg_dicts).strip()
+
+        try:
+            summary = (self.llm_model | StrOutputParser()).invoke(
+                [HumanMessage(content=summary_prompt)],
+            )
+        except Exception:
+            self.agent_logger.logger.exception("Failed to compress history")
+            return
+
+        self.agent_logger.logger.info(
+            ["HISTORY_COMPRESSION", f"{len(old_messages)} messages -> summary", summary],
+        )
+        self.llm_message_history = [
+            HumanMessage(content=f"[これまでの要約]\n{summary}"),
+            *recent_messages,
+        ]
+
     def _send_message_to_llm(self, request: Request | None) -> str | None:
         """Send message to LLM and get response.
 
@@ -241,35 +396,38 @@ class Agent:
         """
         if request is None:
             return None
-        if request.lower() not in self.config["prompt"]:
+        prompt = self._resolve_prompt(request.lower())
+        if prompt is None:
             return None
-        prompt = self.config["prompt"][request.lower()]
         if float(self.config["llm"]["sleep_time"]) > 0:
             sleep(float(self.config["llm"]["sleep_time"]))
-        key = {
-            "info": self.info,
-            "setting": self.setting,
-            "talk_history": self.talk_history,
-            "whisper_history": self.whisper_history,
-            "role": self.role,
-            "sent_talk_count": self.sent_talk_count,
-            "sent_whisper_count": self.sent_whisper_count,
-        }
+        self._compress_history()
+        key = self._get_template_keys()
         template: Template = Template(prompt)
         prompt = template.render(**key).strip()
         if self.llm_model is None:
             self.agent_logger.logger.error("LLM is not initialized")
             return None
+
+        human_message = HumanMessage(content=prompt)
+        messages: list[BaseMessage] = []
+        system_template = self._resolve_prompt("system", merge_default=True)
+        if system_template:
+            system_content = Template(system_template).render(**key).strip()
+            messages.append(SystemMessage(content=system_content))
+        messages.extend(self.llm_message_history)
+        messages.append(human_message)
+
         try:
-            self.llm_message_history.append(HumanMessage(content=prompt))
-            response = (self.llm_model | StrOutputParser()).invoke(self.llm_message_history)
-            self.llm_message_history.append(AIMessage(content=response))
-            self.agent_logger.logger.info(["LLM", prompt, response])
+            response = (self.llm_model | StrOutputParser()).invoke(messages)
         except Exception:
             self.agent_logger.logger.exception("Failed to send message to LLM")
             return None
-        else:
-            return response
+
+        self.llm_message_history.append(human_message)
+        self.llm_message_history.append(AIMessage(content=response))
+        self.agent_logger.logger.info(["LLM", prompt, response])
+        return response
 
     @timeout
     def name(self) -> str:
@@ -304,16 +462,28 @@ class Agent:
                     temperature=float(self.config["google"]["temperature"]),
                     api_key=SecretStr(os.environ["GOOGLE_API_KEY"]),
                 )
+            case "antohropic":
+                self.llm_model = ChatGoogleGenerativeAI(
+                    model=str(self.config["anthropic"]["model"]),
+                    temperature=float(self.config["anthropic"]["temperature"]),
+                    api_key=SecretStr(os.environ["ANTHROPIC_API_KEY"]),
+                )
             case "ollama":
                 self.llm_model = ChatOllama(
                     model=str(self.config["ollama"]["model"]),
                     temperature=float(self.config["ollama"]["temperature"]),
                     base_url=str(self.config["ollama"]["base_url"]),
                 )
+            case "vllm":
+                self.llm_model = ChatOpenAI(
+                    model=str(self.config["vllm"]["model"]),
+                    temperature=float(self.config["vllm"]["temperature"]),
+                    base_url=str(self.config["vllm"]["base_url"]),
+                    api_key=SecretStr("EMPTY"),
+                )
             case _:
                 raise ValueError(model_type, "Unknown LLM type")
         self.llm_model = self.llm_model
-        self._send_message_to_llm(self.request)
 
     def daily_initialize(self) -> None:
         """Perform processing for daily initialization request.
