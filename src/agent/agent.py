@@ -504,6 +504,27 @@ class Agent:
                 ],
             )
 
+        # 5. 整合的支持の判定（ライン support が CO 白判定で説明できるか）
+        # consistent_supports: (supporter, supported, 説明文)
+        consistent_supports: list[tuple[str, str, str]] = []
+        for supporter, lines in self.line_map.items():
+            for supported, stance in lines.items():
+                if "support" not in stance:
+                    continue
+                # ① supporter が supported を白出ししている → 自分が白と判定した相手を擁護
+                if "白" in self.co_divine_map.get(supporter, {}).get(supported, ""):
+                    consistent_supports.append(
+                        (supporter, supported, "白出しした相手を擁護（自然）"),
+                    )
+                # ② supported が supporter を白出ししている → 白判定された側が擁護を返す
+                elif "白" in self.co_divine_map.get(supported, {}).get(supporter, ""):
+                    consistent_supports.append(
+                        (supporter, supported, "白判定してくれた相手に擁護を返す（自然）"),
+                    )
+
+        # 6. 陣営構図（alliance_blocks）: union-find で正の関係（support / 白判定）を連結
+        alliance_blocks = self._compute_alliance_blocks()
+
         return {
             "suspected_via_white_anchor": suspected_via_white_anchor,
             "trusted_via_white_anchor": trusted_via_white_anchor,
@@ -512,7 +533,53 @@ class Agent:
             "unstable_thinkers": unstable_thinkers,
             "critical_unstable": critical_unstable,
             "silent_players": silent_players,
+            "consistent_supports": consistent_supports,
+            "alliance_blocks": alliance_blocks,
         }
+
+    def _compute_alliance_blocks(self) -> list[list[str]]:
+        """正の関係（line support / co 白判定）で連結されたグループを抽出する.
+
+        Union-Find で:
+        - line_map で support 関係にあるペア → 同陣営
+        - co_divine_map で白判定が出ているペア → 同陣営
+        として連結成分を計算し、サイズ 2 以上のグループのみ返す.
+
+        Returns:
+            list[list[str]]: 陣営グループ（各グループ内のメンバー名はソート済み）
+        """
+        parent: dict[str, str] = {}
+
+        def find(x: str) -> str:
+            while parent.get(x, x) != x:
+                parent[x] = parent.get(parent[x], parent[x])
+                x = parent[x]
+            return x
+
+        def add(p: str) -> None:
+            if p not in parent:
+                parent[p] = p
+
+        def union(a: str, b: str) -> None:
+            add(a)
+            add(b)
+            ra, rb = find(a), find(b)
+            if ra != rb:
+                parent[ra] = rb
+
+        for actor, lines in self.line_map.items():
+            for target, stance in lines.items():
+                if "support" in stance:
+                    union(actor, target)
+        for seer, results in self.co_divine_map.items():
+            for target, result in results.items():
+                if "白" in result:
+                    union(seer, target)
+
+        groups: dict[str, list[str]] = {}
+        for p in parent:
+            groups.setdefault(find(p), []).append(p)
+        return [sorted(g) for g in groups.values() if len(g) >= 2]
 
     @staticmethod
     def _strip_code_fence(text: str) -> str:
