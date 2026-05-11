@@ -91,6 +91,11 @@ class Agent:
         self.medium_result_map: dict[str, dict[str, str]] = {}
         self._last_medium_scan_idx: int = 0
 
+        # 騎士 CO セット: 騎士を CO したエージェント名の集合
+        # 護衛・襲撃の判断、player_intel 表示に使う
+        self.bodyguard_co_set: set[str] = set()
+        self._last_bodyguard_scan_idx: int = 0
+
         # ライン精査用マップ:
         # {actor: {target: "strong_support|weak_support|flat|weak_oppose|strong_oppose"}}
         # talk_history から抽出された各プレイヤーの他プレイヤーに対する評価スタンス。
@@ -196,6 +201,8 @@ class Agent:
             self._last_co_scan_idx = 0
             self.medium_result_map = {}
             self._last_medium_scan_idx = 0
+            self.bodyguard_co_set = set()
+            self._last_bodyguard_scan_idx = 0
             self.line_map = {}
             self.line_history = {}
             self.line_flip_count = {}
@@ -369,9 +376,19 @@ class Agent:
         line_derived = self._compute_line_derived(
             confirmed_white_players, alive_count
         )
+        # 生存状況に応じた表示マーカー（死亡時のみ "(死亡)" を付ける。生存はマーカーなし）
+        def _alive_marker(name: str) -> str:
+            if self.info is None:
+                return ""
+            return "" if self.info.status_map.get(name) == Status.ALIVE else "(死亡)"
+
         # 占い CO 一覧の bullet 文字列を precompute（複数テンプレートで重複していた Jinja ループを排除）
+        # actor/target 共に死亡時は "(死亡)" を付与して、LLM が死亡プレイヤーを行動対象に選ばないよう支援
         co_divine_lines = "\n".join(
-            f"- {seer}: " + ", ".join(f"{tgt}={res}" for tgt, res in results.items())
+            f"- {seer}{_alive_marker(seer)}: "
+            + ", ".join(
+                f"{tgt}{_alive_marker(tgt)}={res}" for tgt, res in results.items()
+            )
             for seer, results in self.co_divine_map.items()
         )
         # 自分への占い判定を [{"seer": ..., "color": "白" or "黒"}, ...] 形式で precompute
@@ -408,6 +425,40 @@ class Agent:
                         if seer not in confirmed_fake_seers:
                             confirmed_fake_seers.append(seer)
                         break
+        # プレイヤーごとの統合インテル: 役職主張 + 受領占い結果 + グレー判定
+        # 全プレイヤー（生存・死亡含む）を対象に、自分視点で集約した情報を1行ずつまとめる
+        # 死亡者には "(死亡)" マーカーを付与
+        player_intel_lines = ""
+        if self.info is not None:
+            all_players_for_intel = list(self.info.status_map.keys())
+            # 受領占い: target -> [(seer, color)]
+            incoming_divine: dict[str, list[tuple[str, str]]] = {}
+            for seer, seer_results in self.co_divine_map.items():
+                for target, color in seer_results.items():
+                    incoming_divine.setdefault(target, []).append((seer, color))
+            intel_rows: list[str] = []
+            for p in all_players_for_intel:
+                # 役職主張
+                roles: list[str] = []
+                if p in self.co_divine_map:
+                    roles.append(
+                        "狂人（偽占いCO）" if p in confirmed_fake_seers else "占い師"
+                    )
+                if p in self.medium_result_map:
+                    roles.append("霊能者")
+                if p in self.bodyguard_co_set:
+                    roles.append("騎士")
+                role_str = "、".join(roles) if roles else ""
+                # 受領占い
+                divines = incoming_divine.get(p, [])
+                divine_str = (
+                    "、".join(f"{s}より{c}" for s, c in divines) if divines else ""
+                )
+                gray_marker = " ← グレー" if not roles and not divines else ""
+                intel_rows.append(
+                    f"- {p}{_alive_marker(p)}: 役職=[{role_str}], 占い受領=[{divine_str}]{gray_marker}"
+                )
+            player_intel_lines = "\n".join(intel_rows)
         return {
             "info": self.info,
             "setting": self.setting,
@@ -429,6 +480,8 @@ class Agent:
             "medium_result_map": self.medium_result_map,
             "medium_result_lines": medium_result_lines,
             "confirmed_fake_seers": confirmed_fake_seers,
+            "bodyguard_co_set": self.bodyguard_co_set,
+            "player_intel_lines": player_intel_lines,
             "profile": self.cached_profile,
             "confirmed_white_players": confirmed_white_players,
             "partial_white_players": partial_white_players,
@@ -836,6 +889,69 @@ class Agent:
         self._apply_medium_extraction_items(cast("list[Any]", parsed))
         self.agent_logger.logger.info(["MEDIUM_EXTRACTION", self.medium_result_map])
 
+    def _apply_bodyguard_extraction_items(self, items: list[Any]) -> None:
+        """Apply parsed extraction items to bodyguard_co_set."""
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            d = cast("dict[str, Any]", item)
+            player: Any = d.get("player") or d.get("bodyguard")
+            if not player:
+                continue
+            self.bodyguard_co_set.add(str(player))
+
+    def _extract_bodyguard_co(self) -> None:
+        """Extract bodyguard CO declarations from talk_history via LLM and update bodyguard_co_set.
+
+        トーク履歴から騎士 CO の宣言を LLM で抽出し, bodyguard_co_set に蓄積する.
+        """
+        if self.llm_model is None:
+            return
+        new_talks = self.talk_history[self._last_bodyguard_scan_idx :]
+        if not new_talks:
+            return
+        template = self._resolve_prompt("bodyguard_extraction")
+        if template is None:
+            return
+
+        talks_text = "\n".join(f"Day{t.day} {t.agent}: {t.text}" for t in new_talks)
+        existing_text = (
+            "、".join(sorted(self.bodyguard_co_set)) if self.bodyguard_co_set else "(まだなし)"
+        )
+
+        rendered = (
+            Template(template)
+            .render(
+                talks_text=talks_text,
+                existing_set_text=existing_text,
+                new_talks=new_talks,
+                existing_set=self.bodyguard_co_set,
+            )
+            .strip()
+        )
+
+        try:
+            response = (
+                self.llm_model.bind(temperature=self._get_temperature("bodyguard_extraction"))
+                | StrOutputParser()
+            ).invoke([HumanMessage(content=rendered)])
+        except Exception:
+            self.agent_logger.logger.exception("Failed to extract bodyguard CO")
+            return
+
+        self._last_bodyguard_scan_idx = len(self.talk_history)
+
+        try:
+            parsed: Any = json.loads(self._strip_code_fence(response))
+        except json.JSONDecodeError:
+            self.agent_logger.logger.warning(["BODYGUARD_EXTRACTION_PARSE_ERROR", response])
+            return
+        if not isinstance(parsed, list):
+            return
+
+        self._apply_bodyguard_extraction_items(cast("list[Any]", parsed))
+        self.agent_logger.logger.info(["BODYGUARD_EXTRACTION", sorted(self.bodyguard_co_set)])
+
     _VALID_LINE_STANCES: ClassVar[set[str]] = {
         "strong_support",
         "weak_support",
@@ -1148,9 +1264,10 @@ class Agent:
         self.llm_model = self.llm_model
 
     def _refresh_extractions(self) -> None:
-        """各アクション直前に co_divine_map / medium_result_map / line_map を最新の talk_history で更新."""
+        """各アクション直前に CO・霊能・ライン情報を最新の talk_history で更新."""
         self._extract_co_divine_results()
         self._extract_medium_results()
+        self._extract_bodyguard_co()
         self._extract_line_results()
 
     def daily_initialize(self) -> None:
@@ -1196,6 +1313,17 @@ class Agent:
         self._refresh_extractions()
         self._send_message_to_llm(self.request)
 
+    def _validate_alive_target(self, response: str | None) -> str:
+        """Validate LLM response is a name of an alive agent; fallback to random alive.
+
+        LLM の応答が生存しているエージェント名であることを検証し、無効ならランダムな生存者を返す.
+        死亡プレイヤー名・空文字・無効文字列を含む応答に対する安全網.
+        """
+        alive = self.get_alive_agents()
+        if response and response.strip() in alive:
+            return response.strip()
+        return random.choice(alive)  # noqa: S311
+
     def divine(self) -> str:
         """Return response to divine request.
 
@@ -1205,9 +1333,7 @@ class Agent:
             str: Agent name to divine / 占い対象のエージェント名
         """
         self._refresh_extractions()
-        return self._send_message_to_llm(self.request) or random.choice(  # noqa: S311
-            self.get_alive_agents(),
-        )
+        return self._validate_alive_target(self._send_message_to_llm(self.request))
 
     def guard(self) -> str:
         """Return response to guard request.
@@ -1218,9 +1344,7 @@ class Agent:
             str: Agent name to guard / 護衛対象のエージェント名
         """
         self._refresh_extractions()
-        return self._send_message_to_llm(self.request) or random.choice(  # noqa: S311
-            self.get_alive_agents(),
-        )
+        return self._validate_alive_target(self._send_message_to_llm(self.request))
 
     def vote(self) -> str:
         """Return response to vote request.
@@ -1231,9 +1355,7 @@ class Agent:
             str: Agent name to vote / 投票対象のエージェント名
         """
         self._refresh_extractions()
-        return self._send_message_to_llm(self.request) or random.choice(  # noqa: S311
-            self.get_alive_agents(),
-        )
+        return self._validate_alive_target(self._send_message_to_llm(self.request))
 
     def attack(self) -> str:
         """Return response to attack request.
@@ -1244,9 +1366,7 @@ class Agent:
             str: Agent name to attack / 襲撃対象のエージェント名
         """
         self._refresh_extractions()
-        return self._send_message_to_llm(self.request) or random.choice(  # noqa: S311
-            self.get_alive_agents(),
-        )
+        return self._validate_alive_target(self._send_message_to_llm(self.request))
 
     def finish(self) -> None:
         """Perform processing for game finish request.
