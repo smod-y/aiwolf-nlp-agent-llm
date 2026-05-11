@@ -9,6 +9,7 @@ import asyncio
 import json
 import os
 import random
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from time import sleep
 from typing import TYPE_CHECKING, Any, ClassVar, ParamSpec, TypeVar, cast
@@ -91,6 +92,12 @@ class Agent:
         self.medium_result_map: dict[str, dict[str, str]] = {}
         self._last_medium_scan_idx: int = 0
 
+        # 霊能 CO セット: 霊能者を CO したエージェント名の集合
+        # 結果未報告の段階（Day 1 等）でも CO 宣言だけで蓄積するため、medium_result_map とは独立に保持する.
+        # 単独 CO・生存中なら確定霊能者 = 確定白として扱う判定材料に使う.
+        self.medium_co_set: set[str] = set()
+        self._last_medium_co_scan_idx: int = 0
+
         # 騎士 CO セット: 騎士を CO したエージェント名の集合
         # 護衛・襲撃の判断、player_intel 表示に使う
         self.bodyguard_co_set: set[str] = set()
@@ -111,6 +118,12 @@ class Agent:
         # プロフィール（ペルソナ）は INITIALIZE パケットでのみ届くため、
         # 後続パケットで失われないよう独自にキャッシュする
         self.cached_profile: str | None = None
+
+        # 襲撃された (= 夜中に人狼に噛まれた) プレイヤーの順序付きリスト.
+        # info.attacked_agent は前日の襲撃結果のみ。累積で保持して、
+        # 「先に襲撃された占い師 = 真占い」の推論材料として使う.
+        # 順序が必要なため list で保持 (重複は受信時にチェック).
+        self.attacked_players: list[str] = []
 
         load_dotenv(Path(__file__).parent.joinpath("./../../config/.env"))
 
@@ -177,6 +190,9 @@ class Agent:
             # プロフィールは INITIALIZE 時のみ含まれる仕様なので、初回受信時にキャッシュして保持する
             if packet.info.profile is not None:
                 self.cached_profile = packet.info.profile
+            # 前夜の襲撃情報を順序付きで蓄積（先に襲撃された占い師=真の判定に使う）
+            if packet.info.attacked_agent and packet.info.attacked_agent not in self.attacked_players:
+                self.attacked_players.append(packet.info.attacked_agent)
             self.info = packet.info
         if packet.setting:
             self.setting = packet.setting
@@ -201,12 +217,15 @@ class Agent:
             self._last_co_scan_idx = 0
             self.medium_result_map = {}
             self._last_medium_scan_idx = 0
+            self.medium_co_set = set()
+            self._last_medium_co_scan_idx = 0
             self.bodyguard_co_set = set()
             self._last_bodyguard_scan_idx = 0
             self.line_map = {}
             self.line_history = {}
             self.line_flip_count = {}
             self._last_line_scan_idx = 0
+            self.attacked_players = []
         self.agent_logger.logger.debug(packet)
 
     def get_alive_agents(self) -> list[str]:
@@ -372,6 +391,84 @@ class Agent:
                 else:
                     partial_white_players.append(player)
             black_judged_players = list(black_count.keys())
+        # 騎士 CO の単独確定判定
+        # 騎士 CO が1人だけ（=対抗 CO 無し）の場合の扱い。日数で確度を変える:
+        #   Day 1: 真騎士が必ず生存 → 確定騎士 = 確定白（黒判定よりも優先）
+        #   Day 2: 真騎士が既に死亡している可能性が残るが、基本的に確定扱い（黒判定よりも優先）
+        #   Day 3: ライン精査・他情報と合わせて LLM が最終判断 → 推定どまり
+        #   Day 4 以降: 残り人数が少なくライン精査が主軸 → 特別扱いしない
+        # 自分自身や、人狼陣営から見て相方人狼が CO した場合は偽 CO 確定なので除外する.
+        confirmed_knight_player: str | None = None
+        presumed_knight_player: str | None = None
+        if self.info is not None and len(self.bodyguard_co_set) == 1:
+            single_knight = next(iter(self.bodyguard_co_set))
+            if self.info.status_map.get(single_knight) == Status.ALIVE:
+                is_self = single_knight == self.info.agent
+                is_partner_ww = (
+                    self.role == Role.WEREWOLF
+                    and self.info.role_map.get(single_knight) == Role.WEREWOLF
+                )
+                # 自分が本物の騎士なら、他者の騎士 CO は 100% 偽 → 確定騎士に昇格させない
+                is_real_bodyguard = self.role == Role.BODYGUARD
+                if not is_self and not is_partner_ww and not is_real_bodyguard:
+                    day = self.info.day
+                    if day <= 2:
+                        confirmed_knight_player = single_knight
+                    elif day == 3:
+                        presumed_knight_player = single_knight
+        # 確定騎士は確定白扱いに昇格させる（黒判定があっても優先 = 黒出しした占い師は偽）
+        if confirmed_knight_player is not None:
+            if confirmed_knight_player not in confirmed_white_players:
+                confirmed_white_players.append(confirmed_knight_player)
+            if confirmed_knight_player in partial_white_players:
+                partial_white_players.remove(confirmed_knight_player)
+            if confirmed_knight_player in black_judged_players:
+                black_judged_players.remove(confirmed_knight_player)
+
+        # 霊能 CO の単独確定判定
+        # 霊能 CO が1人だけ・生存中なら確定霊能 = 確定白。
+        # 霊能を騙る人狼/狂人は稀かつリスクが高く、対抗 CO が無ければまず真と扱うのが定石.
+        # 自分自身や、人狼陣営から見て相方人狼が CO した場合は偽 CO 確定なので除外する.
+        # 結果報告 (medium_result_map) を待たず CO 宣言 (medium_co_set) の段階で判定する
+        # → Day 1 で霊能 CO だけが出ているケースでも確定白として扱える.
+        confirmed_medium_player: str | None = None
+        all_medium_cos = self.medium_co_set | set(self.medium_result_map.keys())
+        if self.info is not None and len(all_medium_cos) == 1:
+            single_medium = next(iter(all_medium_cos))
+            if self.info.status_map.get(single_medium) == Status.ALIVE:
+                is_self = single_medium == self.info.agent
+                is_partner_ww = (
+                    self.role == Role.WEREWOLF
+                    and self.info.role_map.get(single_medium) == Role.WEREWOLF
+                )
+                if not is_self and not is_partner_ww:
+                    confirmed_medium_player = single_medium
+        if confirmed_medium_player is not None:
+            if confirmed_medium_player not in confirmed_white_players:
+                confirmed_white_players.append(confirmed_medium_player)
+            if confirmed_medium_player in partial_white_players:
+                partial_white_players.remove(confirmed_medium_player)
+            if confirmed_medium_player in black_judged_players:
+                black_judged_players.remove(confirmed_medium_player)
+
+        # 「先に襲撃された占い師 = 真占い師」の推論。
+        # 人狼陣営は真占いを潰しにかかるため、最初に噛まれた占い CO は真の可能性が極めて高い.
+        # その他の占い CO は (後に同じく噛まれていても) 偏狂人候補として扱う.
+        # 両占いが噛まれた場合に「両方真」とは判断できないため、必ず最初の1人のみを真候補に絞る.
+        first_attacked_seer: str | None = None
+        likely_fake_seers_via_attack: list[str] = []
+        if self.attacked_players and self.co_divine_map:
+            for attacked in self.attacked_players:
+                if attacked in self.co_divine_map:
+                    first_attacked_seer = attacked
+                    break
+            if first_attacked_seer is not None:
+                for seer_co in self.co_divine_map:
+                    if seer_co != first_attacked_seer:
+                        likely_fake_seers_via_attack.append(seer_co)
+        likely_real_seers_via_attack: list[str] = (
+            [first_attacked_seer] if first_attacked_seer is not None else []
+        )
         # ライン精査の派生キー算出
         line_derived = self._compute_line_derived(
             confirmed_white_players, alive_count
@@ -441,13 +538,26 @@ class Agent:
                 # 役職主張
                 roles: list[str] = []
                 if p in self.co_divine_map:
-                    roles.append(
-                        "狂人（偽占いCO）" if p in confirmed_fake_seers else "占い師"
-                    )
-                if p in self.medium_result_map:
-                    roles.append("霊能者")
+                    if p in confirmed_fake_seers:
+                        roles.append("狂人（偽占いCO）")
+                    elif p == first_attacked_seer:
+                        roles.append("占い師（先に襲撃=真濃厚）")
+                    elif p in likely_fake_seers_via_attack:
+                        roles.append("占い師（対抗が先に襲撃された=偽濃厚）")
+                    else:
+                        roles.append("占い師")
+                if p in self.medium_co_set or p in self.medium_result_map:
+                    if p == confirmed_medium_player:
+                        roles.append("霊能者（確定=白扱い）")
+                    else:
+                        roles.append("霊能者")
                 if p in self.bodyguard_co_set:
-                    roles.append("騎士")
+                    if p == confirmed_knight_player:
+                        roles.append("騎士（確定=白扱い）")
+                    elif p == presumed_knight_player:
+                        roles.append("騎士（対抗無し・濃厚）")
+                    else:
+                        roles.append("騎士")
                 role_str = "、".join(roles) if roles else ""
                 # 受領占い
                 divines = incoming_divine.get(p, [])
@@ -479,8 +589,16 @@ class Agent:
             "my_judgments": my_judgments,
             "medium_result_map": self.medium_result_map,
             "medium_result_lines": medium_result_lines,
+            "medium_co_set": self.medium_co_set,
             "confirmed_fake_seers": confirmed_fake_seers,
             "bodyguard_co_set": self.bodyguard_co_set,
+            "confirmed_knight_player": confirmed_knight_player,
+            "presumed_knight_player": presumed_knight_player,
+            "confirmed_medium_player": confirmed_medium_player,
+            "attacked_players": self.attacked_players,
+            "first_attacked_seer": first_attacked_seer,
+            "likely_real_seers_via_attack": likely_real_seers_via_attack,
+            "likely_fake_seers_via_attack": likely_fake_seers_via_attack,
             "player_intel_lines": player_intel_lines,
             "profile": self.cached_profile,
             "confirmed_white_players": confirmed_white_players,
@@ -761,7 +879,7 @@ class Agent:
                 continue
             co_seer_str = str(co_seer)
             # 役職マップによるルーティング: 既に霊能者 CO 済みなら、その発言は霊能結果として扱い、占いマップには入れない
-            if co_seer_str in self.medium_result_map:
+            if co_seer_str in self.medium_co_set or co_seer_str in self.medium_result_map:
                 continue
             normalized = self._normalize_co_result(result)
             if normalized is None:
@@ -769,7 +887,10 @@ class Agent:
             self.co_divine_map.setdefault(co_seer_str, {})[str(target)] = normalized
 
     def _apply_medium_extraction_items(self, items: list[Any]) -> None:
-        """Apply parsed extraction items to medium_result_map."""
+        """Apply parsed extraction items to medium_result_map.
+
+        霊能結果を主張したプレイヤーは霊能 CO 済みでもあるため、medium_co_set にも同期して登録する.
+        """
         for item in items:
             if not isinstance(item, dict):
                 continue
@@ -782,7 +903,9 @@ class Agent:
             normalized = self._normalize_co_result(result)
             if normalized is None:
                 continue
-            self.medium_result_map.setdefault(str(medium), {})[str(target)] = normalized
+            medium_str = str(medium)
+            self.medium_result_map.setdefault(medium_str, {})[str(target)] = normalized
+            self.medium_co_set.add(medium_str)
 
     def _extract_co_divine_results(self) -> None:
         """Extract seer-CO divine claims from talk_history via LLM and update co_divine_map.
@@ -811,10 +934,9 @@ class Agent:
             existing_map_text = "(まだなし)"
 
         # 既に霊能者 CO 済みのプレイヤー名を列挙 → これらの発言は霊能結果なので占い CO 抽出対象外
+        known_mediums = self.medium_co_set | set(self.medium_result_map.keys())
         known_mediums_text = (
-            "、".join(sorted(self.medium_result_map.keys()))
-            if self.medium_result_map
-            else "(なし)"
+            "、".join(sorted(known_mediums)) if known_mediums else "(なし)"
         )
 
         rendered = (
@@ -972,6 +1094,70 @@ class Agent:
 
         self._apply_bodyguard_extraction_items(cast("list[Any]", parsed))
         self.agent_logger.logger.info(["BODYGUARD_EXTRACTION", sorted(self.bodyguard_co_set)])
+
+    def _apply_medium_co_extraction_items(self, items: list[Any]) -> None:
+        """Apply parsed extraction items to medium_co_set."""
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            d = cast("dict[str, Any]", item)
+            player: Any = d.get("player") or d.get("medium")
+            if not player:
+                continue
+            self.medium_co_set.add(str(player))
+
+    def _extract_medium_co(self) -> None:
+        """Extract medium-CO declarations from talk_history via LLM and update medium_co_set.
+
+        トーク履歴から霊能者 CO の宣言を LLM で抽出し, medium_co_set に蓄積する.
+        霊能結果の有無に関わらず宣言だけで追加するため, Day 1 でも確定霊能者として扱える.
+        """
+        if self.llm_model is None:
+            return
+        new_talks = self.talk_history[self._last_medium_co_scan_idx :]
+        if not new_talks:
+            return
+        template = self._resolve_prompt("medium_co_extraction")
+        if template is None:
+            return
+
+        talks_text = "\n".join(f"Day{t.day} {t.agent}: {t.text}" for t in new_talks)
+        existing_text = (
+            "、".join(sorted(self.medium_co_set)) if self.medium_co_set else "(まだなし)"
+        )
+
+        rendered = (
+            Template(template)
+            .render(
+                talks_text=talks_text,
+                existing_set_text=existing_text,
+                new_talks=new_talks,
+                existing_set=self.medium_co_set,
+            )
+            .strip()
+        )
+
+        try:
+            response = (
+                self.llm_model.bind(temperature=self._get_temperature("medium_co_extraction"))
+                | StrOutputParser()
+            ).invoke([HumanMessage(content=rendered)])
+        except Exception:
+            self.agent_logger.logger.exception("Failed to extract medium CO")
+            return
+
+        self._last_medium_co_scan_idx = len(self.talk_history)
+
+        try:
+            parsed: Any = json.loads(self._strip_code_fence(response))
+        except json.JSONDecodeError:
+            self.agent_logger.logger.warning(["MEDIUM_CO_EXTRACTION_PARSE_ERROR", response])
+            return
+        if not isinstance(parsed, list):
+            return
+
+        self._apply_medium_co_extraction_items(cast("list[Any]", parsed))
+        self.agent_logger.logger.info(["MEDIUM_CO_EXTRACTION", sorted(self.medium_co_set)])
 
     _VALID_LINE_STANCES: ClassVar[set[str]] = {
         "strong_support",
@@ -1287,10 +1473,11 @@ class Agent:
     def _refresh_extractions(self) -> None:
         """各アクション直前に CO・霊能・ライン情報を最新の talk_history で更新.
 
-        実行順: medium → bodyguard → co → line
-        medium / bodyguard を先に走らせて役職マップを構築し、
+        実行順: medium_co → medium_results → bodyguard → co → line
+        medium_co / medium_results / bodyguard を先に走らせて役職マップを構築し、
         co_extraction の応用時に既知の霊能者・騎士の発言を弾けるようにする.
         """
+        self._extract_medium_co()
         self._extract_medium_results()
         self._extract_bodyguard_co()
         self._extract_co_divine_results()
@@ -1336,6 +1523,8 @@ class Agent:
 
         昼終了リクエストに対する処理を行う.
         """
+        if self.info and self.info.status_map.get(self.info.agent) != Status.ALIVE:
+            return
         self._refresh_extractions()
         self._send_message_to_llm(self.request)
 
