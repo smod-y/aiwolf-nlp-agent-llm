@@ -745,7 +745,11 @@ class Agent:
         return None
 
     def _apply_co_extraction_items(self, items: list[Any]) -> None:
-        """Apply parsed extraction items to co_divine_map."""
+        """Apply parsed extraction items to co_divine_map.
+
+        役職マップ（medium_result_map）を見て、既に霊能者として CO 済みのプレイヤーの
+        判定発言は霊能結果と判断して占い CO マップには取り込まない（誤分類防止）.
+        """
         for item in items:
             if not isinstance(item, dict):
                 continue
@@ -755,10 +759,14 @@ class Agent:
             result: Any = d.get("result")
             if not co_seer or not target or result is None:
                 continue
+            co_seer_str = str(co_seer)
+            # 役職マップによるルーティング: 既に霊能者 CO 済みなら、その発言は霊能結果として扱い、占いマップには入れない
+            if co_seer_str in self.medium_result_map:
+                continue
             normalized = self._normalize_co_result(result)
             if normalized is None:
                 continue
-            self.co_divine_map.setdefault(str(co_seer), {})[str(target)] = normalized
+            self.co_divine_map.setdefault(co_seer_str, {})[str(target)] = normalized
 
     def _apply_medium_extraction_items(self, items: list[Any]) -> None:
         """Apply parsed extraction items to medium_result_map."""
@@ -802,11 +810,19 @@ class Agent:
         else:
             existing_map_text = "(まだなし)"
 
+        # 既に霊能者 CO 済みのプレイヤー名を列挙 → これらの発言は霊能結果なので占い CO 抽出対象外
+        known_mediums_text = (
+            "、".join(sorted(self.medium_result_map.keys()))
+            if self.medium_result_map
+            else "(なし)"
+        )
+
         rendered = (
             Template(template)
             .render(
                 talks_text=talks_text,
                 existing_map_text=existing_map_text,
+                known_mediums_text=known_mediums_text,
                 new_talks=new_talks,
                 existing_map=self.co_divine_map,
             )
@@ -1269,10 +1285,15 @@ class Agent:
         self.llm_model = self.llm_model
 
     def _refresh_extractions(self) -> None:
-        """各アクション直前に CO・霊能・ライン情報を最新の talk_history で更新."""
-        self._extract_co_divine_results()
+        """各アクション直前に CO・霊能・ライン情報を最新の talk_history で更新.
+
+        実行順: medium → bodyguard → co → line
+        medium / bodyguard を先に走らせて役職マップを構築し、
+        co_extraction の応用時に既知の霊能者・騎士の発言を弾けるようにする.
+        """
         self._extract_medium_results()
         self._extract_bodyguard_co()
+        self._extract_co_divine_results()
         self._extract_line_results()
 
     def daily_initialize(self) -> None:
