@@ -641,11 +641,15 @@ class Agent:
                         partners_alive_count += 1
         # 相方を黒判定した占い師（=真占い師確定の有力候補）
         partner_black_judged_by: list[str] = []
+        # 相方を白判定した占い師（=狂人/偽占い師確定の有力候補。味方として扱う）
+        partner_white_judged_by: list[str] = []
         for seer, results in self.co_divine_map.items():
             for partner in werewolf_partners:
-                if "黒" in results.get(partner, ""):
-                    if seer not in partner_black_judged_by:
-                        partner_black_judged_by.append(seer)
+                partner_result = results.get(partner, "")
+                if "黒" in partner_result and seer not in partner_black_judged_by:
+                    partner_black_judged_by.append(seer)
+                if "白" in partner_result and seer not in partner_white_judged_by:
+                    partner_white_judged_by.append(seer)
         # 自分を黒判定した占い師（黒判定された WW 用）
         my_black_judged_by: list[str] = []
         if self_name:
@@ -666,6 +670,7 @@ class Agent:
             "werewolf_partners": werewolf_partners,
             "partners_alive_count": partners_alive_count,
             "partner_black_judged_by": partner_black_judged_by,
+            "partner_white_judged_by": partner_white_judged_by,
             "my_black_judged_by": my_black_judged_by,
         }
 
