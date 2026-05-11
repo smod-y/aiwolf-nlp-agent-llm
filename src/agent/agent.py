@@ -86,6 +86,11 @@ class Agent:
         self.co_divine_map: dict[str, dict[str, str]] = {}
         self._last_co_scan_idx: int = 0
 
+        # 霊能 CO マップ: {霊能 CO したエージェント名: {追放対象: "白(人間)" | "黒(人狼)"}}
+        # 霊能は追放済みプレイヤーの判定であり、占い CO 結果との矛盾検出で偽占い師を確定できる
+        self.medium_result_map: dict[str, dict[str, str]] = {}
+        self._last_medium_scan_idx: int = 0
+
         # ライン精査用マップ:
         # {actor: {target: "strong_support|weak_support|flat|weak_oppose|strong_oppose"}}
         # talk_history から抽出された各プレイヤーの他プレイヤーに対する評価スタンス。
@@ -189,6 +194,8 @@ class Agent:
             self.llm_message_history: list[BaseMessage] = []
             self.co_divine_map = {}
             self._last_co_scan_idx = 0
+            self.medium_result_map = {}
+            self._last_medium_scan_idx = 0
             self.line_map = {}
             self.line_history = {}
             self.line_flip_count = {}
@@ -362,6 +369,45 @@ class Agent:
         line_derived = self._compute_line_derived(
             confirmed_white_players, alive_count
         )
+        # 占い CO 一覧の bullet 文字列を precompute（複数テンプレートで重複していた Jinja ループを排除）
+        co_divine_lines = "\n".join(
+            f"- {seer}: " + ", ".join(f"{tgt}={res}" for tgt, res in results.items())
+            for seer, results in self.co_divine_map.items()
+        )
+        # 自分への占い判定を [{"seer": ..., "color": "白" or "黒"}, ...] 形式で precompute
+        my_judgments: list[dict[str, str]] = []
+        if self.info is not None:
+            self_name = self.info.agent
+            for seer, results in self.co_divine_map.items():
+                if self_name not in results:
+                    continue
+                result = results[self_name]
+                if "白" in result:
+                    my_judgments.append({"seer": seer, "color": "白"})
+                elif "黒" in result:
+                    my_judgments.append({"seer": seer, "color": "黒"})
+        # 霊能 CO 一覧の bullet 文字列を precompute
+        medium_result_lines = "\n".join(
+            f"- {medium}: " + ", ".join(f"{tgt}={res}" for tgt, res in results.items())
+            for medium, results in self.medium_result_map.items()
+        )
+        # 確定偽占い師: 霊能結果と占い結果に矛盾がある占い師 (例: 占い師 X が「Y は白」、霊能が「Y は黒」)
+        # 霊能 CO が複数あると真偽不明なので、1 件のときのみ判定（安全側に倒す）
+        confirmed_fake_seers: list[str] = []
+        if len(self.medium_result_map) == 1:
+            medium_results = next(iter(self.medium_result_map.values()))
+            for seer, seer_results in self.co_divine_map.items():
+                for target, seer_color in seer_results.items():
+                    medium_color = medium_results.get(target)
+                    if medium_color is None:
+                        continue
+                    # 白/黒のラベルが一致しなければ矛盾
+                    seer_white = "白" in seer_color
+                    medium_white = "白" in medium_color
+                    if seer_white != medium_white:
+                        if seer not in confirmed_fake_seers:
+                            confirmed_fake_seers.append(seer)
+                        break
         return {
             "info": self.info,
             "setting": self.setting,
@@ -378,6 +424,11 @@ class Agent:
             "is_first_talk_today": is_first_talk_today,
             "is_first_whisper_today": is_first_whisper_today,
             "co_divine_map": self.co_divine_map,
+            "co_divine_lines": co_divine_lines,
+            "my_judgments": my_judgments,
+            "medium_result_map": self.medium_result_map,
+            "medium_result_lines": medium_result_lines,
+            "confirmed_fake_seers": confirmed_fake_seers,
             "profile": self.cached_profile,
             "confirmed_white_players": confirmed_white_players,
             "partial_white_players": partial_white_players,
@@ -651,6 +702,22 @@ class Agent:
                 continue
             self.co_divine_map.setdefault(str(co_seer), {})[str(target)] = normalized
 
+    def _apply_medium_extraction_items(self, items: list[Any]) -> None:
+        """Apply parsed extraction items to medium_result_map."""
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            d = cast("dict[str, Any]", item)
+            medium: Any = d.get("medium") or d.get("co_medium")
+            target: Any = d.get("target")
+            result: Any = d.get("result")
+            if not medium or not target or result is None:
+                continue
+            normalized = self._normalize_co_result(result)
+            if normalized is None:
+                continue
+            self.medium_result_map.setdefault(str(medium), {})[str(target)] = normalized
+
     def _extract_co_divine_results(self) -> None:
         """Extract seer-CO divine claims from talk_history via LLM and update co_divine_map.
 
@@ -710,6 +777,64 @@ class Agent:
 
         self._apply_co_extraction_items(cast("list[Any]", parsed))
         self.agent_logger.logger.info(["CO_EXTRACTION", self.co_divine_map])
+
+    def _extract_medium_results(self) -> None:
+        """Extract medium-CO claims from talk_history via LLM and update medium_result_map.
+
+        トーク履歴から霊能 CO の主張(誰が追放されて人狼/人間だったか)を LLM で抽出し,
+        medium_result_map に蓄積する. 占い CO 結果と矛盾する霊能結果が出現したら
+        該当占い師を偽（=狂人）として確定できる.
+        """
+        if self.llm_model is None:
+            return
+        new_talks = self.talk_history[self._last_medium_scan_idx :]
+        if not new_talks:
+            return
+        template = self._resolve_prompt("medium_extraction")
+        if template is None:
+            return
+
+        talks_text = "\n".join(f"Day{t.day} {t.agent}: {t.text}" for t in new_talks)
+        if self.medium_result_map:
+            existing_map_text = "\n".join(
+                f"- {medium}: " + ", ".join(f"{tgt}={res}" for tgt, res in results.items())
+                for medium, results in self.medium_result_map.items()
+            )
+        else:
+            existing_map_text = "(まだなし)"
+
+        rendered = (
+            Template(template)
+            .render(
+                talks_text=talks_text,
+                existing_map_text=existing_map_text,
+                new_talks=new_talks,
+                existing_map=self.medium_result_map,
+            )
+            .strip()
+        )
+
+        try:
+            response = (
+                self.llm_model.bind(temperature=self._get_temperature("medium_extraction"))
+                | StrOutputParser()
+            ).invoke([HumanMessage(content=rendered)])
+        except Exception:
+            self.agent_logger.logger.exception("Failed to extract medium results")
+            return
+
+        self._last_medium_scan_idx = len(self.talk_history)
+
+        try:
+            parsed: Any = json.loads(self._strip_code_fence(response))
+        except json.JSONDecodeError:
+            self.agent_logger.logger.warning(["MEDIUM_EXTRACTION_PARSE_ERROR", response])
+            return
+        if not isinstance(parsed, list):
+            return
+
+        self._apply_medium_extraction_items(cast("list[Any]", parsed))
+        self.agent_logger.logger.info(["MEDIUM_EXTRACTION", self.medium_result_map])
 
     _VALID_LINE_STANCES: ClassVar[set[str]] = {
         "strong_support",
@@ -1023,8 +1148,9 @@ class Agent:
         self.llm_model = self.llm_model
 
     def _refresh_extractions(self) -> None:
-        """各アクション直前に co_divine_map と line_map を最新の talk_history で更新."""
+        """各アクション直前に co_divine_map / medium_result_map / line_map を最新の talk_history で更新."""
         self._extract_co_divine_results()
+        self._extract_medium_results()
         self._extract_line_results()
 
     def daily_initialize(self) -> None:
