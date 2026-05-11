@@ -525,6 +525,30 @@ class Agent:
         # 6. 陣営構図（alliance_blocks）: union-find で正の関係（support / 白判定）を連結
         alliance_blocks = self._compute_alliance_blocks()
 
+        # 7. 人狼チーム情報（WW のみ意味を持つが、テンプレ側で role 判定するので全員に渡す）
+        # role_map は WW には他 WW も見える（仕様）
+        werewolf_partners: list[str] = []
+        partners_alive_count = 0
+        if self.info is not None and self.info.role_map:
+            for agent, r in self.info.role_map.items():
+                if r == Role.WEREWOLF and agent != self.info.agent:
+                    werewolf_partners.append(agent)
+                    if self.info.status_map.get(agent) == Status.ALIVE:
+                        partners_alive_count += 1
+        # 相方を黒判定した占い師（=真占い師確定の有力候補）
+        partner_black_judged_by: list[str] = []
+        for seer, results in self.co_divine_map.items():
+            for partner in werewolf_partners:
+                if "黒" in results.get(partner, ""):
+                    if seer not in partner_black_judged_by:
+                        partner_black_judged_by.append(seer)
+        # 自分を黒判定した占い師（黒判定された WW 用）
+        my_black_judged_by: list[str] = []
+        if self_name:
+            for seer, results in self.co_divine_map.items():
+                if "黒" in results.get(self_name, ""):
+                    my_black_judged_by.append(seer)
+
         return {
             "suspected_via_white_anchor": suspected_via_white_anchor,
             "trusted_via_white_anchor": trusted_via_white_anchor,
@@ -535,6 +559,10 @@ class Agent:
             "silent_players": silent_players,
             "consistent_supports": consistent_supports,
             "alliance_blocks": alliance_blocks,
+            "werewolf_partners": werewolf_partners,
+            "partners_alive_count": partners_alive_count,
+            "partner_black_judged_by": partner_black_judged_by,
+            "my_black_judged_by": my_black_judged_by,
         }
 
     def _compute_alliance_blocks(self) -> list[list[str]]:
@@ -661,9 +689,10 @@ class Agent:
         )
 
         try:
-            response = (self.llm_model | StrOutputParser()).invoke(
-                [HumanMessage(content=rendered)],
-            )
+            response = (
+                self.llm_model.bind(temperature=self._get_temperature("co_extraction"))
+                | StrOutputParser()
+            ).invoke([HumanMessage(content=rendered)])
         except Exception:
             self.agent_logger.logger.exception("Failed to extract CO divine results")
             return
@@ -775,9 +804,10 @@ class Agent:
         )
 
         try:
-            response = (self.llm_model | StrOutputParser()).invoke(
-                [HumanMessage(content=rendered)],
-            )
+            response = (
+                self.llm_model.bind(temperature=self._get_temperature("line_extraction"))
+                | StrOutputParser()
+            ).invoke([HumanMessage(content=rendered)])
         except Exception:
             self.agent_logger.logger.exception("Failed to extract line results")
             return
@@ -797,6 +827,29 @@ class Agent:
         self.agent_logger.logger.info(
             ["LINE_EXTRACTION", self.line_map, "flips", self.line_flip_count],
         )
+
+    def _get_temperature(self, task_name: str | None = None) -> float:
+        """Resolve temperature for the given task from the active LLM provider config.
+
+        現在の LLM プロバイダ設定からタスク別 temperature を取得する.
+        temperature が単一の数値なら全タスクで同値、辞書なら task_name をキーに
+        引き、見つからなければ "default" にフォールバックする.
+
+        Args:
+            task_name (str | None): タスク名（"line_extraction" / "talk" 等）.
+                None の場合は default 値を返す.
+
+        Returns:
+            float: 解決された temperature 値.
+        """
+        model_type = str(self.config["llm"]["type"])
+        temp_config: Any = self.config.get(model_type, {}).get("temperature", 0.7)
+        if isinstance(temp_config, dict):
+            cfg = cast("dict[str, Any]", temp_config)
+            if task_name is not None and task_name in cfg:
+                return float(cfg[task_name])
+            return float(cfg.get("default", 0.7))
+        return float(temp_config)
 
     def _get_compression_config(self) -> dict[str, Any] | None:
         """Get history compression config for the current agent count.
@@ -847,9 +900,10 @@ class Agent:
         summary_prompt = Template(summary_template).render(messages=msg_dicts).strip()
 
         try:
-            summary = (self.llm_model | StrOutputParser()).invoke(
-                [HumanMessage(content=summary_prompt)],
-            )
+            summary = (
+                self.llm_model.bind(temperature=self._get_temperature("history_summary"))
+                | StrOutputParser()
+            ).invoke([HumanMessage(content=summary_prompt)])
         except Exception:
             self.agent_logger.logger.exception("Failed to compress history")
             return
@@ -898,7 +952,10 @@ class Agent:
         messages.append(human_message)
 
         try:
-            response = (self.llm_model | StrOutputParser()).invoke(messages)
+            response = (
+                self.llm_model.bind(temperature=self._get_temperature(request.lower()))
+                | StrOutputParser()
+            ).invoke(messages)
         except Exception:
             self.agent_logger.logger.exception("Failed to send message to LLM")
             return None
@@ -928,35 +985,36 @@ class Agent:
             return
 
         model_type = str(self.config["llm"]["type"])
+        default_temperature = self._get_temperature()
         match model_type:
             case "openai":
                 self.llm_model = ChatOpenAI(
                     model=str(self.config["openai"]["model"]),
-                    temperature=float(self.config["openai"]["temperature"]),
+                    temperature=default_temperature,
                     api_key=SecretStr(os.environ["OPENAI_API_KEY"]),
                 )
             case "google":
                 self.llm_model = ChatGoogleGenerativeAI(
                     model=str(self.config["google"]["model"]),
-                    temperature=float(self.config["google"]["temperature"]),
+                    temperature=default_temperature,
                     api_key=SecretStr(os.environ["GOOGLE_API_KEY"]),
                 )
             case "antohropic":
                 self.llm_model = ChatGoogleGenerativeAI(
                     model=str(self.config["anthropic"]["model"]),
-                    temperature=float(self.config["anthropic"]["temperature"]),
+                    temperature=default_temperature,
                     api_key=SecretStr(os.environ["ANTHROPIC_API_KEY"]),
                 )
             case "ollama":
                 self.llm_model = ChatOllama(
                     model=str(self.config["ollama"]["model"]),
-                    temperature=float(self.config["ollama"]["temperature"]),
+                    temperature=default_temperature,
                     base_url=str(self.config["ollama"]["base_url"]),
                 )
             case "vllm":
                 self.llm_model = ChatOpenAI(
                     model=str(self.config["vllm"]["model"]),
-                    temperature=float(self.config["vllm"]["temperature"]),
+                    temperature=default_temperature,
                     base_url=str(self.config["vllm"]["base_url"]),
                     api_key=SecretStr("EMPTY"),
                 )
