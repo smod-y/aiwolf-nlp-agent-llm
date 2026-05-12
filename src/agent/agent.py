@@ -85,6 +85,11 @@ class Agent:
         # 占い CO マップ: {占い CO したエージェント名: {対象: "白(人間)" | "黒(人狼)"}}
         # 全エージェントが talk_history からの抽出で蓄積し、矛盾検出に使う
         self.co_divine_map: dict[str, dict[str, str]] = {}
+        # 占い CO の判定が出された Day を記録: {占い CO したエージェント名: {対象: day}}
+        # kakoi 判定で「襲撃以前の判定」を識別するために使う
+        self.co_divine_day_map: dict[str, dict[str, int]] = {}
+        # 最初の占い CO が襲撃された Day（kakoi 判定の境界）
+        self.first_seer_attack_day: int | None = None
         self._last_co_scan_idx: int = 0
 
         # 霊能 CO マップ: {霊能 CO したエージェント名: {追放対象: "白(人間)" | "黒(人狼)"}}
@@ -193,6 +198,12 @@ class Agent:
             # 前夜の襲撃情報を順序付きで蓄積（先に襲撃された占い師=真の判定に使う）
             if packet.info.attacked_agent and packet.info.attacked_agent not in self.attacked_players:
                 self.attacked_players.append(packet.info.attacked_agent)
+                # 最初の占い CO 襲撃が判明した Day を記録（kakoi 判定の境界）
+                if (
+                    self.first_seer_attack_day is None
+                    and packet.info.attacked_agent in self.co_divine_map
+                ):
+                    self.first_seer_attack_day = packet.info.day
             self.info = packet.info
         if packet.setting:
             self.setting = packet.setting
@@ -214,6 +225,8 @@ class Agent:
             self.whisper_history: list[Talk] = []
             self.llm_message_history: list[BaseMessage] = []
             self.co_divine_map = {}
+            self.co_divine_day_map = {}
+            self.first_seer_attack_day = None
             self._last_co_scan_idx = 0
             self.medium_result_map = {}
             self._last_medium_scan_idx = 0
@@ -481,10 +494,16 @@ class Agent:
 
         # 占い CO 一覧の bullet 文字列を precompute（複数テンプレートで重複していた Jinja ループを排除）
         # actor/target 共に死亡時は "(死亡)" を付与して、LLM が死亡プレイヤーを行動対象に選ばないよう支援
+        # 判定日が既知なら "(Day N)" を付与して、LLM が時系列で占い結果を解釈できるよう支援
+        def _judgment_day_marker(seer: str, tgt: str) -> str:
+            day = self.co_divine_day_map.get(seer, {}).get(tgt)
+            return f"(Day{day})" if day is not None else ""
+
         co_divine_lines = "\n".join(
             f"- {seer}{_alive_marker(seer)}: "
             + ", ".join(
-                f"{tgt}{_alive_marker(tgt)}={res}" for tgt, res in results.items()
+                f"{tgt}{_alive_marker(tgt)}={res}{_judgment_day_marker(seer, tgt)}"
+                for tgt, res in results.items()
             )
             for seer, results in self.co_divine_map.items()
         )
@@ -560,6 +579,23 @@ class Agent:
                     if "白" not in color:
                         continue
                     if self.info.status_map.get(target) != Status.ALIVE:
+                        continue
+                    # Day 判定: 判定日 < 襲撃判明日のみ kakoi 候補
+                    # （襲撃以降の判定は「囲ったから襲撃した」という時系列の論理から外れる）
+                    judgment_day = self.co_divine_day_map.get(fake_seer, {}).get(target)
+                    if (
+                        judgment_day is not None
+                        and self.first_seer_attack_day is not None
+                        and judgment_day >= self.first_seer_attack_day
+                    ):
+                        continue
+                    # 片白判定: 他の占い CO からも判定を受けていれば「片白」ではない
+                    # （確定白や占い結果矛盾は別ロジックで扱うため kakoi 対象外）
+                    judged_by_others = any(
+                        other_seer != fake_seer and target in other_results
+                        for other_seer, other_results in self.co_divine_map.items()
+                    )
+                    if judged_by_others:
                         continue
                     if (
                         self.role == Role.WEREWOLF
@@ -935,6 +971,7 @@ class Agent:
             co_seer: Any = d.get("co_seer") or d.get("seer")
             target: Any = d.get("target")
             result: Any = d.get("result")
+            day_val: Any = d.get("day")
             if not co_seer or not target or result is None:
                 continue
             co_seer_str = str(co_seer)
@@ -944,7 +981,11 @@ class Agent:
             normalized = self._normalize_co_result(result)
             if normalized is None:
                 continue
-            self.co_divine_map.setdefault(co_seer_str, {})[str(target)] = normalized
+            target_str = str(target)
+            self.co_divine_map.setdefault(co_seer_str, {})[target_str] = normalized
+            # 判定が出された Day を記録（後発の同一 (seer, target) ペアでは初出 Day を維持）
+            if isinstance(day_val, int) and target_str not in self.co_divine_day_map.get(co_seer_str, {}):
+                self.co_divine_day_map.setdefault(co_seer_str, {})[target_str] = day_val
 
     def _apply_medium_extraction_items(self, items: list[Any]) -> None:
         """Apply parsed extraction items to medium_result_map.
