@@ -536,6 +536,18 @@ class Agent:
                 if isinstance(line_derived, dict)
                 else []
             )
+            ww_partners_alive_count_for_kakoi: int = (
+                line_derived.get("partners_alive_count", 0)
+                if isinstance(line_derived, dict)
+                else 0
+            )
+            # 単独人狼（相方が全員死亡）の場合、唐突な　kakoi 誘導は吊り先誘導として怪しく見えやすく
+            # 自分が同じ偽占い師から白判定を受けているケースで村に即座に見抜かれるため無効化する.
+            is_lone_werewolf_for_kakoi: bool = (
+                self.role == Role.WEREWOLF
+                and bool(ww_partners_for_kakoi)
+                and ww_partners_alive_count_for_kakoi == 0
+            )
             self_name_for_kakoi = self.info.agent
             all_co_holders: set[str] = (
                 set(self.co_divine_map.keys())
@@ -551,6 +563,7 @@ class Agent:
                         continue
                     if (
                         self.role == Role.WEREWOLF
+                        and not is_lone_werewolf_for_kakoi
                         and target != self_name_for_kakoi
                         and target not in ww_partners_for_kakoi
                     ):
