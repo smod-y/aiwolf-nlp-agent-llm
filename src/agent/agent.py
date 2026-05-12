@@ -522,6 +522,49 @@ class Agent:
                         if seer not in confirmed_fake_seers:
                             confirmed_fake_seers.append(seer)
                         break
+        # 「囲い」候補の検出: Day 1 夜に占い師が襲撃された場合、襲撃されていない対抗占い CO は
+        # 狂人候補となる. その白判定対象は「狂人が匿った人狼」の可能性があり、
+        # 人狼陣営は黒塗り誘導の材料、村陣営は人狼候補として疑う対象になる.
+        # 先に襲撃された占い師（真占い濃厚）の白判定はそもそも除外（likely_fake_seers_via_attack に含まれない）.
+        # 人狼用は自分・相方人狼への白判定を除外（白証明を薄めないため）.
+        # 村側用は CO 持ち（占い・霊能・騎士 CO）への白判定を除外（CO 持ちは別ロジックで扱うため）.
+        kakoi_candidates_ww: list[tuple[str, str]] = []
+        kakoi_candidates_village: list[tuple[str, str]] = []
+        if first_attacked_seer is not None and self.info is not None:
+            ww_partners_for_kakoi: list[str] = (
+                line_derived.get("werewolf_partners", [])
+                if isinstance(line_derived, dict)
+                else []
+            )
+            self_name_for_kakoi = self.info.agent
+            all_co_holders: set[str] = (
+                set(self.co_divine_map.keys())
+                | self.medium_co_set
+                | set(self.medium_result_map.keys())
+                | self.bodyguard_co_set
+            )
+            for fake_seer in likely_fake_seers_via_attack:
+                for target, color in self.co_divine_map.get(fake_seer, {}).items():
+                    if "白" not in color:
+                        continue
+                    if self.info.status_map.get(target) != Status.ALIVE:
+                        continue
+                    if (
+                        self.role == Role.WEREWOLF
+                        and target != self_name_for_kakoi
+                        and target not in ww_partners_for_kakoi
+                    ):
+                        kakoi_candidates_ww.append((fake_seer, target))
+                    if target not in all_co_holders:
+                        kakoi_candidates_village.append((fake_seer, target))
+        kakoi_lines_ww = "\n".join(
+            f"- {seer}{_alive_marker(seer)} が「{target}{_alive_marker(target)}」を白判定 → 囲い候補（黒塗り誘導の標的）"
+            for seer, target in kakoi_candidates_ww
+        )
+        kakoi_lines_village = "\n".join(
+            f"- {seer}{_alive_marker(seer)} が「{target}{_alive_marker(target)}」を白判定 → 囲い候補（人狼を匿うための白の可能性）"
+            for seer, target in kakoi_candidates_village
+        )
         # プレイヤーごとの統合インテル: 役職主張 + 受領占い結果 + グレー判定
         # 全プレイヤー（生存・死亡含む）を対象に、自分視点で集約した情報を1行ずつまとめる
         # 死亡者には "(死亡)" マーカーを付与
@@ -599,6 +642,10 @@ class Agent:
             "first_attacked_seer": first_attacked_seer,
             "likely_real_seers_via_attack": likely_real_seers_via_attack,
             "likely_fake_seers_via_attack": likely_fake_seers_via_attack,
+            "kakoi_candidates_ww": kakoi_candidates_ww,
+            "kakoi_candidates_village": kakoi_candidates_village,
+            "kakoi_lines_ww": kakoi_lines_ww,
+            "kakoi_lines_village": kakoi_lines_village,
             "player_intel_lines": player_intel_lines,
             "profile": self.cached_profile,
             "confirmed_white_players": confirmed_white_players,
