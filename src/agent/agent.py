@@ -1232,10 +1232,17 @@ class Agent:
             return
 
         talks_text = "\n".join(f"Day{t.day} {t.agent}: {t.text}" for t in new_talks)
-        if self.line_map:
+        # LLM が出力するのは new_talks の発話者についてのスタンスだけなので、
+        # 既存マップも new_talks に登場する actor 分に絞ってもデデュープに過不足なし.
+        # 等価変換だがプロンプトトークンを大幅削減できる.
+        mentioned_actors = {t.agent for t in new_talks}
+        relevant_map = {
+            actor: lines for actor, lines in self.line_map.items() if actor in mentioned_actors
+        }
+        if relevant_map:
             existing_map_text = "\n".join(
                 f"- {actor}: " + ", ".join(f"{tgt}={st}" for tgt, st in lines.items())
-                for actor, lines in self.line_map.items()
+                for actor, lines in relevant_map.items()
             )
         else:
             existing_map_text = "(まだなし)"
@@ -1246,7 +1253,7 @@ class Agent:
                 talks_text=talks_text,
                 existing_map_text=existing_map_text,
                 new_talks=new_talks,
-                existing_map=self.line_map,
+                existing_map=relevant_map,
             )
             .strip()
         )
@@ -1473,15 +1480,19 @@ class Agent:
     def _refresh_extractions(self) -> None:
         """各アクション直前に CO・霊能・ライン情報を最新の talk_history で更新.
 
-        実行順: medium_co → medium_results → bodyguard → co → line
-        medium_co / medium_results / bodyguard を先に走らせて役職マップを構築し、
-        co_extraction の応用時に既知の霊能者・騎士の発言を弾けるようにする.
+        Stage 1 (並列): medium_co / medium_results / bodyguard / line は互いに独立なので並列実行.
+        Stage 2 (直列): co_divine は medium_co_set と medium_result_map を参照するため Stage 1 完了後に実行.
         """
-        self._extract_medium_co()
-        self._extract_medium_results()
-        self._extract_bodyguard_co()
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            futures = [
+                pool.submit(self._extract_medium_co),
+                pool.submit(self._extract_medium_results),
+                pool.submit(self._extract_bodyguard_co),
+                pool.submit(self._extract_line_results),
+            ]
+            for f in futures:
+                f.result()
         self._extract_co_divine_results()
-        self._extract_line_results()
 
     def daily_initialize(self) -> None:
         """Perform processing for daily initialization request.
@@ -1523,8 +1534,6 @@ class Agent:
 
         昼終了リクエストに対する処理を行う.
         """
-        if self.info and self.info.status_map.get(self.info.agent) != Status.ALIVE:
-            return
         self._refresh_extractions()
         self._send_message_to_llm(self.request)
 
@@ -1598,6 +1607,15 @@ class Agent:
         Returns:
             str | None: Action result string or None / アクションの結果文字列またはNone
         """
+        # 死亡エージェントは LLM 処理を伴う全アクションを短絡する.
+        # タイムアウト → プロセス死亡 → ゲーム異常終了 の連鎖を防ぐための防御策.
+        # NAME / INITIALIZE / FINISH はプロトコル上必要なので除外する.
+        if (
+            self.request not in (Request.NAME, Request.INITIALIZE, Request.FINISH)
+            and self.info is not None
+            and self.info.status_map.get(self.info.agent) != Status.ALIVE
+        ):
+            return None
         match self.request:
             case Request.NAME:
                 return self.name()
