@@ -729,16 +729,15 @@ class Agent:
         Returns:
             dict with keys:
             - suspected_via_white_anchor: list of (actor, stance) opposing 確定白
-            - trusted_via_white_anchor  : list of (actor, stance) supporting 確定白
             - my_affinity_top           : (most_similar, most_opposite) self との親和
             - white_affinity_top        : 確定白との親和（最初の1人）
             - unstable_thinkers         : flip>=1 の actor 一覧
             - critical_unstable         : flip>=3 の actor 一覧
             - silent_players            : engagement が平均/2 未満の生存プレイヤー
         """
-        # 1. 確定白アンカーでの分類
+        # 1. 確定白アンカーでの分類: 確定白を疑うラインのみ抽出
+        #   （擁護ラインは村人/人狼どちらも同じ動きなので情報価値が低く、扱わない）
         suspected_via_white_anchor: list[tuple[str, str]] = []
-        trusted_via_white_anchor: list[tuple[str, str]] = []
         self_name = self.info.agent if self.info else None
         for white in confirmed_white_players:
             for actor, lines in self.line_map.items():
@@ -749,8 +748,6 @@ class Agent:
                     continue
                 if "oppose" in stance:
                     suspected_via_white_anchor.append((actor, stance))
-                elif "support" in stance:
-                    trusted_via_white_anchor.append((actor, stance))
 
         # 2. ペア親和度（共通対象による暗黙同盟）
         # affinity[A][B] = sum over targets X of sign(A[X])*sign(B[X])*|A[X]|*|B[X]|
@@ -886,7 +883,6 @@ class Agent:
 
         return {
             "suspected_via_white_anchor": suspected_via_white_anchor,
-            "trusted_via_white_anchor": trusted_via_white_anchor,
             "my_affinity_top": my_affinity_top,
             "white_affinity_top": white_affinity_top,
             "unstable_thinkers": unstable_thinkers,
