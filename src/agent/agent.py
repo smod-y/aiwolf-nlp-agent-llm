@@ -404,6 +404,40 @@ class Agent:
                 else:
                     partial_white_players.append(player)
             black_judged_players = list(black_count.keys())
+        # 確定偽占い師・確定真占い師の先行計算
+        # 騎士判定で「確定真占い師による黒判定があれば騎士 CO は偽の可能性高い」のチェックに使うため、
+        # この時点で算出する.
+        # 霊能 CO が複数あると真偽不明なので、1 件のときのみ判定（安全側に倒す）.
+        confirmed_fake_seers: list[str] = []
+        if len(self.medium_result_map) == 1:
+            medium_results = next(iter(self.medium_result_map.values()))
+            # ケース1: 占い結果と霊能結果に矛盾している占い師
+            for seer, seer_results in self.co_divine_map.items():
+                for target, seer_color in seer_results.items():
+                    medium_color = medium_results.get(target)
+                    if medium_color is None:
+                        continue
+                    # 白/黒のラベルが一致しなければ矛盾
+                    seer_white = "白" in seer_color
+                    medium_white = "白" in medium_color
+                    if seer_white != medium_white:
+                        if seer not in confirmed_fake_seers:
+                            confirmed_fake_seers.append(seer)
+                        break
+            # ケース2: 占い CO 本人が追放され、霊能で人狼と判明している場合
+            for seer in self.co_divine_map:
+                if "黒" in medium_results.get(seer, "") and seer not in confirmed_fake_seers:
+                    confirmed_fake_seers.append(seer)
+        # 確定真占い師: 占い CO のうち、確定偽占い師を除いて 1 人だけ残るならその 1 人（消去法）.
+        # 計算コスト回避のため「黒判定 == 霊能黒判定」の直接判定ロジックは実装しない.
+        # 真確定から他者を自動 fake にする逆方向のロジックも実装しない（fake → true 方向のみ）.
+        confirmed_true_seers: list[str] = []
+        remaining_seer_cos = [
+            s for s in self.co_divine_map if s not in confirmed_fake_seers
+        ]
+        if len(confirmed_fake_seers) >= 1 and len(remaining_seer_cos) == 1:
+            confirmed_true_seers.append(remaining_seer_cos[0])
+
         # 騎士 CO の単独確定判定
         # 騎士 CO が1人だけ（=対抗 CO 無し）の場合の扱い。日数で確度を変える:
         #   Day 1: 真騎士が必ず生存 → 確定騎士 = 確定白（黒判定よりも優先）
@@ -411,6 +445,7 @@ class Agent:
         #   Day 3: ライン精査・他情報と合わせて LLM が最終判断 → 推定どまり
         #   Day 4 以降: 残り人数が少なくライン精査が主軸 → 特別扱いしない
         # 自分自身や、人狼陣営から見て相方人狼が CO した場合は偽 CO 確定なので除外する.
+        # 確定真占い師から黒判定されている場合も、人狼の騎士騙りの可能性が高いため除外する.
         confirmed_knight_player: str | None = None
         presumed_knight_player: str | None = None
         if self.info is not None and len(self.bodyguard_co_set) == 1:
@@ -423,7 +458,17 @@ class Agent:
                 )
                 # 自分が本物の騎士なら、他者の騎士 CO は 100% 偽 → 確定騎士に昇格させない
                 is_real_bodyguard = self.role == Role.BODYGUARD
-                if not is_self and not is_partner_ww and not is_real_bodyguard:
+                # 確定真占い師から黒判定されている場合は、人狼の騎士騙りの可能性が高い
+                real_seer_black_judged = any(
+                    "黒" in self.co_divine_map.get(true_seer, {}).get(single_knight, "")
+                    for true_seer in confirmed_true_seers
+                )
+                if (
+                    not is_self
+                    and not is_partner_ww
+                    and not is_real_bodyguard
+                    and not real_seer_black_judged
+                ):
                     day = self.info.day
                     if day <= 2:
                         confirmed_knight_player = single_knight
@@ -524,23 +569,8 @@ class Agent:
             f"- {medium}: " + ", ".join(f"{tgt}={res}" for tgt, res in results.items())
             for medium, results in self.medium_result_map.items()
         )
-        # 確定偽占い師: 霊能結果と占い結果に矛盾がある占い師 (例: 占い師 X が「Y は白」、霊能が「Y は黒」)
-        # 霊能 CO が複数あると真偽不明なので、1 件のときのみ判定（安全側に倒す）
-        confirmed_fake_seers: list[str] = []
-        if len(self.medium_result_map) == 1:
-            medium_results = next(iter(self.medium_result_map.values()))
-            for seer, seer_results in self.co_divine_map.items():
-                for target, seer_color in seer_results.items():
-                    medium_color = medium_results.get(target)
-                    if medium_color is None:
-                        continue
-                    # 白/黒のラベルが一致しなければ矛盾
-                    seer_white = "白" in seer_color
-                    medium_white = "白" in medium_color
-                    if seer_white != medium_white:
-                        if seer not in confirmed_fake_seers:
-                            confirmed_fake_seers.append(seer)
-                        break
+        # 確定偽占い師（confirmed_fake_seers）と確定真占い師（confirmed_true_seers）は
+        # 騎士判定で参照するため、騎士チェック前で既に算出済み.
         # 「囲い」候補の検出: Day 1 夜に占い師が襲撃された場合、襲撃されていない対抗占い CO は
         # 狂人候補となる. その白判定対象は「狂人が匿った人狼」の可能性があり、
         # 人狼陣営は黒塗り誘導の材料、村陣営は人狼候補として疑う対象になる.
@@ -696,6 +726,7 @@ class Agent:
             "medium_result_lines": medium_result_lines,
             "medium_co_set": self.medium_co_set,
             "confirmed_fake_seers": confirmed_fake_seers,
+            "confirmed_true_seers": confirmed_true_seers,
             "bodyguard_co_set": self.bodyguard_co_set,
             "confirmed_knight_player": confirmed_knight_player,
             "presumed_knight_player": presumed_knight_player,
