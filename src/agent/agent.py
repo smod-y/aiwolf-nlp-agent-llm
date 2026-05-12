@@ -575,7 +575,19 @@ class Agent:
                 | self.bodyguard_co_set
             )
             for fake_seer in likely_fake_seers_via_attack:
-                for target, color in self.co_divine_map.get(fake_seer, {}).items():
+                fake_seer_judgments = self.co_divine_map.get(fake_seer, {})
+                # 人狼サイド限定の発火条件: 自分または相方人狼のいずれも
+                # この fake_seer から白判定を受けていない こと.
+                # （受けている状態で kakoi 誘導すると「同じ fake_seer の他の白を疑う=身内切り」と
+                #  村に即座に見抜かれるため、人狼側の kakoi 誘導は自粛する）
+                ww_white_judged_by_this_fake = (
+                    "白" in fake_seer_judgments.get(self_name_for_kakoi, "")
+                    or any(
+                        "白" in fake_seer_judgments.get(partner, "")
+                        for partner in ww_partners_for_kakoi
+                    )
+                )
+                for target, color in fake_seer_judgments.items():
                     if "白" not in color:
                         continue
                     if self.info.status_map.get(target) != Status.ALIVE:
@@ -600,6 +612,7 @@ class Agent:
                     if (
                         self.role == Role.WEREWOLF
                         and not is_lone_werewolf_for_kakoi
+                        and not ww_white_judged_by_this_fake
                         and target != self_name_for_kakoi
                         and target not in ww_partners_for_kakoi
                     ):
