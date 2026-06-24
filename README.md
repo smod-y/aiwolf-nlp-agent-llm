@@ -80,16 +80,28 @@ cp config/config.en.yml.example config/config.yml
 
 
 ## ダウンロード
+
+```bash
 curl -LO https://github.com/aiwolfdial/aiwolf-nlp-server/releases/latest/download/aiwolf-nlp-server-linux-amd64
 curl -LO https://github.com/aiwolfdial/aiwolf-nlp-server/releases/latest/download/default_5.yml
 curl -LO https://github.com/aiwolfdial/aiwolf-nlp-server/releases/latest/download/default_9.yml
 curl -LO https://github.com/aiwolfdial/aiwolf-nlp-server/releases/latest/download/freeform_5.yml
 curl -Lo .env https://github.com/aiwolfdial/aiwolf-nlp-server/releases/latest/download/example.env
 chmod u+x ./aiwolf-nlp-server-linux-amd64
+```
 
 ## 実行方法
+
+サーバの起動:
+
+```bash
 ./server/aiwolf-nlp-server-linux-amd64 -c ./default_5.yml # 5人ゲームの場合
 ./aiwolf-nlp-server-linux-amd64 -c ./default_9.yml # 9人ゲームの場合
 ./aiwolf-nlp-server-linux-amd64 -c ./freeform.yml # チャット形式の場合
+```
 
+エージェントの起動:
+
+```bash
 uv run src/main.py -c config/config.yml
+```
