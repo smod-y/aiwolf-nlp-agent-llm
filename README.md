@@ -12,6 +12,31 @@
 >本リポジトリはフォーク元のサンプル実装そのものではありません。
 >独自に追加・変更した設定、プロンプト、エージェントロジックなどが含まれています。
 
+## 仕様
+
+Go 製ゲームサーバ [`aiwolf-nlp-server`](https://github.com/aiwolfdial/aiwolf-nlp-server) に WebSocket で接続し、`aiwolf_nlp_common` プロトコルでやり取りする LLM ベースのエージェントです。
+
+### 全体構成
+
+- `src/main.py` が YAML 設定を読み込み、`agent.num` 個のプロセスを spawn する。`-c` には複数パスや glob を指定でき、設定ファイル数 × `agent.num` のプロセスが並列起動される。
+- 各プロセスは WebSocket に接続してパケット受信ループに入り、リクエスト種別に応じて処理を分岐する。
+  - **ターン制方式**: 1 パケット = 1 アクション。`setting.timeout.action` を超えると打ち切る。
+  - **グループチャット方式（freeform）**: トーク/囁きフェーズ中に一定間隔で発言を生成し続ける。
+- LLM は `config.llm.type`（`openai` / `google` / `ollama`）に応じて初期化し、対話履歴をゲーム全体で累積させてコンテキストとする。
+
+### エージェントロジック
+
+- 役職別クラス（村人・人狼・占い師・狩人・霊媒師・狂人）が基底クラス `Agent` を継承し、役職固有の戦略を実装する。
+- 発言履歴から **CO・占い結果・霊媒結果・狩人 CO・各プレイヤーのライン（白黒スタンス）** を構造化抽出し、状態として保持する。
+- **確定白・確定村** を区別して管理し、吊り誘導・投票・襲撃・囲いなどの意思決定に反映する。
+- グレー吊り（Day1）／片白吊り（Day2 以降）／ライン切り（Day1に相方人狼が黒出しされた場合）など、フェーズに応じた吊り候補選定方針を持つ。
+- 履歴が長くなった際の **対話履歴の圧縮** に対応する。
+
+### プロンプト・設定
+
+- プロンプトは設定 YAML の `prompt.<request_name>` に格納され、Jinja2 でゲーム情報・発言履歴・役職などを埋め込んで生成する。
+- 実際には `config/config.yml` を読み込んで使用する。`config/*.example`（`config.jp.yml.example` / `config.en.yml.example` など）はあくまで設定例であり、これをコピーして `config.yml` を作成する。
+
 ## 環境構築
 
 > [!IMPORTANT]
@@ -64,9 +89,7 @@ chmod u+x ./aiwolf-nlp-server-linux-amd64
 
 ## 実行方法
 ./server/aiwolf-nlp-server-linux-amd64 -c ./default_5.yml # 5人ゲームの場合
-# ./aiwolf-nlp-server-linux-amd64 -c ./default_9.yml # 9人ゲームの場合
-# ./aiwolf-nlp-server-linux-amd64 -c ./default_13.yml # 13人ゲームの場合
-# ./aiwolf-nlp-server-linux-amd64 -c ./freeform.yml # チャット形式の場合
+./aiwolf-nlp-server-linux-amd64 -c ./default_9.yml # 9人ゲームの場合
+./aiwolf-nlp-server-linux-amd64 -c ./freeform.yml # チャット形式の場合
 
- uv run src/main.py -c config/config.yml # 実行方法
- uv run src/main.py -c config/config_5.yml
+uv run src/main.py -c config/config.yml
