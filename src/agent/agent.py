@@ -1094,7 +1094,7 @@ class Agent:
 
         try:
             response = (
-                self.llm_model.bind(temperature=self._get_temperature("co_extraction"))
+                self.llm_model.bind(temperature=self._get_temperature("co_extraction")).with_retry(stop_after_attempt=3)
                 | StrOutputParser()
             ).invoke([HumanMessage(content=rendered)])
         except Exception:
@@ -1153,7 +1153,7 @@ class Agent:
 
         try:
             response = (
-                self.llm_model.bind(temperature=self._get_temperature("medium_extraction"))
+                self.llm_model.bind(temperature=self._get_temperature("medium_extraction")).with_retry(stop_after_attempt=3)
                 | StrOutputParser()
             ).invoke([HumanMessage(content=rendered)])
         except Exception:
@@ -1216,7 +1216,7 @@ class Agent:
 
         try:
             response = (
-                self.llm_model.bind(temperature=self._get_temperature("bodyguard_extraction"))
+                self.llm_model.bind(temperature=self._get_temperature("bodyguard_extraction")).with_retry(stop_after_attempt=3)
                 | StrOutputParser()
             ).invoke([HumanMessage(content=rendered)])
         except Exception:
@@ -1280,7 +1280,7 @@ class Agent:
 
         try:
             response = (
-                self.llm_model.bind(temperature=self._get_temperature("medium_co_extraction"))
+                self.llm_model.bind(temperature=self._get_temperature("medium_co_extraction")).with_retry(stop_after_attempt=3)
                 | StrOutputParser()
             ).invoke([HumanMessage(content=rendered)])
         except Exception:
@@ -1401,7 +1401,7 @@ class Agent:
 
         try:
             response = (
-                self.llm_model.bind(temperature=self._get_temperature("line_extraction"))
+                self.llm_model.bind(temperature=self._get_temperature("line_extraction")).with_retry(stop_after_attempt=3)
                 | StrOutputParser()
             ).invoke([HumanMessage(content=rendered)])
         except Exception:
@@ -1497,7 +1497,7 @@ class Agent:
 
         try:
             summary = (
-                self.llm_model.bind(temperature=self._get_temperature("history_summary"))
+                self.llm_model.bind(temperature=self._get_temperature("history_summary")).with_retry(stop_after_attempt=3)
                 | StrOutputParser()
             ).invoke([HumanMessage(content=summary_prompt)])
         except Exception:
@@ -1549,7 +1549,7 @@ class Agent:
 
         try:
             response = (
-                self.llm_model.bind(temperature=self._get_temperature(request.lower()))
+                self.llm_model.bind(temperature=self._get_temperature(request.lower())).with_retry(stop_after_attempt=3)
                 | StrOutputParser()
             ).invoke(messages)
         except Exception:
