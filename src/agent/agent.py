@@ -9,6 +9,7 @@ import asyncio
 import json
 import os
 import random
+import re
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from time import sleep
@@ -18,6 +19,7 @@ from dotenv import load_dotenv
 from jinja2 import Template
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_core.output_parsers import StrOutputParser
+from langchain_core.runnables import RunnableLambda
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_ollama import ChatOllama
 from langchain_openai import ChatOpenAI
@@ -39,6 +41,12 @@ if TYPE_CHECKING:
 
 P = ParamSpec("P")
 T = TypeVar("T")
+
+_THINK_TAG_RE = re.compile(r"<think>.*?</think>", flags=re.DOTALL)
+
+
+def _strip_think_tags(text: str) -> str:
+    return _THINK_TAG_RE.sub("", text).strip()
 
 
 class Agent:
@@ -1547,11 +1555,16 @@ class Agent:
         messages.extend(self.llm_message_history)
         messages.append(human_message)
 
+        use_cot = request in (Request.TALK, Request.WHISPER)
+        chain = (
+            self.llm_model.bind(temperature=self._get_temperature(request.lower())).with_retry(stop_after_attempt=3)
+            | StrOutputParser()
+        )
+        if use_cot:
+            chain = chain | RunnableLambda(_strip_think_tags)
+
         try:
-            response = (
-                self.llm_model.bind(temperature=self._get_temperature(request.lower())).with_retry(stop_after_attempt=3)
-                | StrOutputParser()
-            ).invoke(messages)
+            response = chain.invoke(messages)
         except Exception:
             self.agent_logger.logger.exception("Failed to send message to LLM")
             return None
