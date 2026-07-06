@@ -6,7 +6,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import os
 import random
 import re
@@ -54,6 +53,73 @@ class ActionDecision(BaseModel):
 
     reasoning: str = Field(description="判断の根拠を段階的に記述")
     target: str = Field(description="対象プレイヤー名")
+
+
+class CoExtractionItem(BaseModel):
+    """Schema for a single seer-CO divine claim."""
+
+    day: int | None = Field(default=None, description="占い結果を主張した発話の day")
+    seer: str = Field(description="占い師として CO したプレイヤー名")
+    target: str = Field(description="占い対象プレイヤー名")
+    result: str = Field(description="白 または 黒")
+
+
+class CoExtractionResult(BaseModel):
+    """Schema for seer-CO extraction output."""
+
+    items: list[CoExtractionItem] = Field(default_factory=list)  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]
+
+
+class MediumExtractionItem(BaseModel):
+    """Schema for a single medium result claim."""
+
+    medium: str = Field(description="霊能者として CO したプレイヤー名")
+    target: str = Field(description="霊能対象の追放済みプレイヤー名")
+    result: str = Field(description="白 または 黒")
+
+
+class MediumExtractionResult(BaseModel):
+    """Schema for medium extraction output."""
+
+    items: list[MediumExtractionItem] = Field(default_factory=list)  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]
+
+
+class MediumCoItem(BaseModel):
+    """Schema for a single medium-CO declaration."""
+
+    player: str = Field(description="霊能者を CO したプレイヤー名")
+
+
+class MediumCoResult(BaseModel):
+    """Schema for medium-CO extraction output."""
+
+    items: list[MediumCoItem] = Field(default_factory=list)  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]
+
+
+class BodyguardCoItem(BaseModel):
+    """Schema for a single bodyguard-CO declaration."""
+
+    player: str = Field(description="騎士を CO したプレイヤー名")
+
+
+class BodyguardCoResult(BaseModel):
+    """Schema for bodyguard-CO extraction output."""
+
+    items: list[BodyguardCoItem] = Field(default_factory=list)  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]
+
+
+class LineExtractionItem(BaseModel):
+    """Schema for a single line (stance) extraction."""
+
+    actor: str = Field(description="発話者の名前")
+    target: str = Field(description="スタンスの対象プレイヤー名")
+    stance: str = Field(description="strong_support / weak_support / flat / weak_oppose / strong_oppose")
+
+
+class LineExtractionResult(BaseModel):
+    """Schema for line extraction output."""
+
+    items: list[LineExtractionItem] = Field(default_factory=list)  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]
 
 
 class Agent:
@@ -988,19 +1054,6 @@ class Agent:
         return [sorted(g) for g in groups.values() if len(g) >= 2]
 
     @staticmethod
-    def _strip_code_fence(text: str) -> str:
-        """Strip leading/trailing ``` code fence lines if present."""
-        text = text.strip()
-        if not text.startswith("```"):
-            return text
-        lines = text.split("\n")
-        if lines and lines[0].startswith("```"):
-            lines = lines[1:]
-        if lines and lines[-1].startswith("```"):
-            lines = lines[:-1]
-        return "\n".join(lines)
-
-    @staticmethod
     def _normalize_co_result(result: Any) -> str | None:  # noqa: ANN401
         """Normalize a divine result string to '白(人間)' / '黒(人狼)' or None."""
         if not result:
@@ -1108,26 +1161,23 @@ class Agent:
         )
 
         try:
-            response = (
-                self.llm_model.bind(temperature=self._get_temperature("co_extraction")).with_retry(stop_after_attempt=3)
-                | StrOutputParser()
-            ).invoke([HumanMessage(content=rendered)])
+            structured_llm = self.llm_model.with_structured_output(CoExtractionResult, method="json_mode")  # pyright: ignore[reportUnknownMemberType]
+            result = cast(
+                "CoExtractionResult | None",
+                structured_llm.bind(temperature=self._get_temperature("co_extraction")).with_retry(stop_after_attempt=3).invoke([HumanMessage(content=rendered)]),
+            )
         except Exception:
             self.agent_logger.logger.exception("Failed to extract CO divine results")
             return
 
-        # 同じ talks を二重に投げないよう、LLM 呼び出し成功時点でスキャン位置を進める
         self._last_co_scan_idx = len(self.talk_history)
 
-        try:
-            parsed: Any = json.loads(self._strip_code_fence(response))
-        except json.JSONDecodeError:
-            self.agent_logger.logger.warning(["CO_EXTRACTION_PARSE_ERROR", response])
-            return
-        if not isinstance(parsed, list):
+        if result is None or not result.items:
             return
 
-        self._apply_co_extraction_items(cast("list[Any]", parsed))
+        self._apply_co_extraction_items(
+            [item.model_dump() for item in result.items],
+        )
         self.agent_logger.logger.info(["CO_EXTRACTION", self.co_divine_map])
 
     def _extract_medium_results(self) -> None:
@@ -1167,25 +1217,23 @@ class Agent:
         )
 
         try:
-            response = (
-                self.llm_model.bind(temperature=self._get_temperature("medium_extraction")).with_retry(stop_after_attempt=3)
-                | StrOutputParser()
-            ).invoke([HumanMessage(content=rendered)])
+            structured_llm = self.llm_model.with_structured_output(MediumExtractionResult, method="json_mode")  # pyright: ignore[reportUnknownMemberType]
+            result = cast(
+                "MediumExtractionResult | None",
+                structured_llm.bind(temperature=self._get_temperature("medium_extraction")).with_retry(stop_after_attempt=3).invoke([HumanMessage(content=rendered)]),
+            )
         except Exception:
             self.agent_logger.logger.exception("Failed to extract medium results")
             return
 
         self._last_medium_scan_idx = len(self.talk_history)
 
-        try:
-            parsed: Any = json.loads(self._strip_code_fence(response))
-        except json.JSONDecodeError:
-            self.agent_logger.logger.warning(["MEDIUM_EXTRACTION_PARSE_ERROR", response])
-            return
-        if not isinstance(parsed, list):
+        if result is None or not result.items:
             return
 
-        self._apply_medium_extraction_items(cast("list[Any]", parsed))
+        self._apply_medium_extraction_items(
+            [item.model_dump() for item in result.items],
+        )
         self.agent_logger.logger.info(["MEDIUM_EXTRACTION", self.medium_result_map])
 
     def _apply_bodyguard_extraction_items(self, items: list[Any]) -> None:
@@ -1230,25 +1278,23 @@ class Agent:
         )
 
         try:
-            response = (
-                self.llm_model.bind(temperature=self._get_temperature("bodyguard_extraction")).with_retry(stop_after_attempt=3)
-                | StrOutputParser()
-            ).invoke([HumanMessage(content=rendered)])
+            structured_llm = self.llm_model.with_structured_output(BodyguardCoResult, method="json_mode")  # pyright: ignore[reportUnknownMemberType]
+            result = cast(
+                "BodyguardCoResult | None",
+                structured_llm.bind(temperature=self._get_temperature("bodyguard_extraction")).with_retry(stop_after_attempt=3).invoke([HumanMessage(content=rendered)]),
+            )
         except Exception:
             self.agent_logger.logger.exception("Failed to extract bodyguard CO")
             return
 
         self._last_bodyguard_scan_idx = len(self.talk_history)
 
-        try:
-            parsed: Any = json.loads(self._strip_code_fence(response))
-        except json.JSONDecodeError:
-            self.agent_logger.logger.warning(["BODYGUARD_EXTRACTION_PARSE_ERROR", response])
-            return
-        if not isinstance(parsed, list):
+        if result is None or not result.items:
             return
 
-        self._apply_bodyguard_extraction_items(cast("list[Any]", parsed))
+        self._apply_bodyguard_extraction_items(
+            [item.model_dump() for item in result.items],
+        )
         self.agent_logger.logger.info(["BODYGUARD_EXTRACTION", sorted(self.bodyguard_co_set)])
 
     def _apply_medium_co_extraction_items(self, items: list[Any]) -> None:
@@ -1294,25 +1340,23 @@ class Agent:
         )
 
         try:
-            response = (
-                self.llm_model.bind(temperature=self._get_temperature("medium_co_extraction")).with_retry(stop_after_attempt=3)
-                | StrOutputParser()
-            ).invoke([HumanMessage(content=rendered)])
+            structured_llm = self.llm_model.with_structured_output(MediumCoResult, method="json_mode")  # pyright: ignore[reportUnknownMemberType]
+            result = cast(
+                "MediumCoResult | None",
+                structured_llm.bind(temperature=self._get_temperature("medium_co_extraction")).with_retry(stop_after_attempt=3).invoke([HumanMessage(content=rendered)]),
+            )
         except Exception:
             self.agent_logger.logger.exception("Failed to extract medium CO")
             return
 
         self._last_medium_co_scan_idx = len(self.talk_history)
 
-        try:
-            parsed: Any = json.loads(self._strip_code_fence(response))
-        except json.JSONDecodeError:
-            self.agent_logger.logger.warning(["MEDIUM_CO_EXTRACTION_PARSE_ERROR", response])
-            return
-        if not isinstance(parsed, list):
+        if result is None or not result.items:
             return
 
-        self._apply_medium_co_extraction_items(cast("list[Any]", parsed))
+        self._apply_medium_co_extraction_items(
+            [item.model_dump() for item in result.items],
+        )
         self.agent_logger.logger.info(["MEDIUM_CO_EXTRACTION", sorted(self.medium_co_set)])
 
     _VALID_LINE_STANCES: ClassVar[set[str]] = {
@@ -1415,10 +1459,11 @@ class Agent:
         )
 
         try:
-            response = (
-                self.llm_model.bind(temperature=self._get_temperature("line_extraction")).with_retry(stop_after_attempt=3)
-                | StrOutputParser()
-            ).invoke([HumanMessage(content=rendered)])
+            structured_llm = self.llm_model.with_structured_output(LineExtractionResult, method="json_mode")  # pyright: ignore[reportUnknownMemberType]
+            result = cast(
+                "LineExtractionResult | None",
+                structured_llm.bind(temperature=self._get_temperature("line_extraction")).with_retry(stop_after_attempt=3).invoke([HumanMessage(content=rendered)]),
+            )
         except Exception:
             self.agent_logger.logger.exception("Failed to extract line results")
             return
@@ -1426,15 +1471,13 @@ class Agent:
         scan_end_idx = len(self.talk_history)
         self._last_line_scan_idx = scan_end_idx
 
-        try:
-            parsed: Any = json.loads(self._strip_code_fence(response))
-        except json.JSONDecodeError:
-            self.agent_logger.logger.warning(["LINE_EXTRACTION_PARSE_ERROR", response])
-            return
-        if not isinstance(parsed, list):
+        if result is None or not result.items:
             return
 
-        self._apply_line_extraction_items(cast("list[Any]", parsed), scan_end_idx)
+        self._apply_line_extraction_items(
+            [item.model_dump() for item in result.items],
+            scan_end_idx,
+        )
         self.agent_logger.logger.info(
             ["LINE_EXTRACTION", self.line_map, "flips", self.line_flip_count],
         )
