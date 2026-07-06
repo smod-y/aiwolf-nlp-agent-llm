@@ -25,7 +25,7 @@ from langchain_ollama import ChatOllama
 from langchain_openai import ChatOpenAI
 
 # from langchain_anthropic import ChatAnthropic
-from pydantic import SecretStr
+from pydantic import BaseModel, Field, SecretStr
 
 if TYPE_CHECKING:
     from langchain_core.language_models.chat_models import BaseChatModel
@@ -47,6 +47,13 @@ _THINK_TAG_RE = re.compile(r"<think>.*?</think>", flags=re.DOTALL)
 
 def _strip_think_tags(text: str) -> str:
     return _THINK_TAG_RE.sub("", text).strip()
+
+
+class ActionDecision(BaseModel):
+    """Structured output schema for vote/divine/guard/attack actions."""
+
+    reasoning: str = Field(description="判断の根拠を段階的に記述")
+    target: str = Field(description="対象プレイヤー名")
 
 
 class Agent:
@@ -1702,6 +1709,54 @@ class Agent:
             return response.strip()
         return random.choice(alive)  # noqa: S311
 
+    def _send_action_to_llm(self, request: Request) -> str | None:
+        """Send action request to LLM with structured output (CoT reasoning + target).
+
+        ActionDecision スキーマで reasoning と target を JSON 出力させ、
+        reasoning をログに記録し target を返す.
+        """
+        prompt = self._resolve_prompt(request.lower())
+        if prompt is None:
+            return None
+        if float(self.config["llm"]["sleep_time"]) > 0:
+            sleep(float(self.config["llm"]["sleep_time"]))
+        self._compress_history()
+        key = self._get_template_keys()
+        template: Template = Template(prompt)
+        prompt = template.render(**key).strip()
+        if self.llm_model is None:
+            self.agent_logger.logger.error("LLM is not initialized")
+            return None
+
+        human_message = HumanMessage(content=prompt)
+        messages: list[BaseMessage] = []
+        system_template = self._resolve_prompt("system", merge_default=True)
+        if system_template:
+            system_content = Template(system_template).render(**key).strip()
+            messages.append(SystemMessage(content=system_content))
+        messages.extend(self.llm_message_history)
+        messages.append(human_message)
+
+        try:
+            structured_llm = self.llm_model.with_structured_output(ActionDecision, method="json_mode")  # pyright: ignore[reportUnknownMemberType]
+            result = cast(
+                "ActionDecision | None",
+                structured_llm.bind(temperature=self._get_temperature(request.lower())).with_retry(stop_after_attempt=3).invoke(messages),
+            )
+        except Exception:
+            self.agent_logger.logger.exception("Failed to send action to LLM")
+            return None
+
+        if result is None:
+            return None
+
+        self.llm_message_history.append(human_message)
+        self.llm_message_history.append(AIMessage(content=result.target))
+        self.agent_logger.logger.info(
+            ["LLM_ACTION", prompt, {"reasoning": result.reasoning, "target": result.target}],
+        )
+        return result.target
+
     def divine(self) -> str:
         """Return response to divine request.
 
@@ -1711,7 +1766,7 @@ class Agent:
             str: Agent name to divine / 占い対象のエージェント名
         """
         self._refresh_extractions()
-        return self._validate_alive_target(self._send_message_to_llm(self.request))
+        return self._validate_alive_target(self._send_action_to_llm(Request.DIVINE))
 
     def guard(self) -> str:
         """Return response to guard request.
@@ -1722,7 +1777,7 @@ class Agent:
             str: Agent name to guard / 護衛対象のエージェント名
         """
         self._refresh_extractions()
-        return self._validate_alive_target(self._send_message_to_llm(self.request))
+        return self._validate_alive_target(self._send_action_to_llm(Request.GUARD))
 
     def vote(self) -> str:
         """Return response to vote request.
@@ -1733,7 +1788,7 @@ class Agent:
             str: Agent name to vote / 投票対象のエージェント名
         """
         self._refresh_extractions()
-        return self._validate_alive_target(self._send_message_to_llm(self.request))
+        return self._validate_alive_target(self._send_action_to_llm(Request.VOTE))
 
     def attack(self) -> str:
         """Return response to attack request.
@@ -1744,7 +1799,7 @@ class Agent:
             str: Agent name to attack / 襲撃対象のエージェント名
         """
         self._refresh_extractions()
-        return self._validate_alive_target(self._send_message_to_llm(self.request))
+        return self._validate_alive_target(self._send_action_to_llm(Request.ATTACK))
 
     def finish(self) -> None:
         """Perform processing for game finish request.
