@@ -41,11 +41,14 @@ if TYPE_CHECKING:
 P = ParamSpec("P")
 T = TypeVar("T")
 
-_THINK_TAG_RE = re.compile(r"<think>.*?</think>", flags=re.DOTALL)
-
-
 def _strip_think_tags(text: str) -> str:
-    return _THINK_TAG_RE.sub("", text).strip()
+    close_idx = text.rfind("</think>")
+    if close_idx != -1:
+        return text[close_idx + len("</think>"):].strip()
+    open_idx = text.rfind("<think>")
+    if open_idx != -1:
+        return text[open_idx + len("<think>"):].strip()
+    return text.strip()
 
 
 class ActionDecision(BaseModel):
@@ -751,7 +754,6 @@ class Agent:
                     incoming_divine.setdefault(target, []).append((seer, color))
             intel_rows: list[str] = []
             for p in all_players_for_intel:
-                # 役職主張
                 roles: list[str] = []
                 if p in self.co_divine_map:
                     if p in confirmed_fake_seers:
@@ -775,7 +777,6 @@ class Agent:
                     else:
                         roles.append("騎士")
                 role_str = "、".join(roles) if roles else ""
-                # 受領占い
                 divines = incoming_divine.get(p, [])
                 divine_str = (
                     "、".join(f"{s}より{c}" for s, c in divines) if divines else ""
@@ -986,7 +987,6 @@ class Agent:
                     partner_black_judged_by.append(seer)
                 if "白" in partner_result and seer not in partner_white_judged_by:
                     partner_white_judged_by.append(seer)
-        # 自分を黒判定した占い師（黒判定された WW 用）
         my_black_judged_by: list[str] = []
         if self_name:
             for seer, results in self.co_divine_map.items():
@@ -1596,6 +1596,9 @@ class Agent:
             self.agent_logger.logger.error("LLM is not initialized")
             return None
 
+        use_cot = request in (Request.TALK, Request.WHISPER)
+        if use_cot:
+            prompt += "\n\n発話の前に <think>〜</think> タグで思考過程を記述してから、タグの外に最終的な発話だけを出力してください。"
         human_message = HumanMessage(content=prompt)
         messages: list[BaseMessage] = []
         system_template = self._resolve_prompt("system", merge_default=True)
@@ -1604,20 +1607,23 @@ class Agent:
             messages.append(SystemMessage(content=system_content))
         messages.extend(self.llm_message_history)
         messages.append(human_message)
-
-        use_cot = request in (Request.TALK, Request.WHISPER)
         chain = (
             self.llm_model.bind(temperature=self._get_temperature(request.lower())).with_retry(stop_after_attempt=3)
             | StrOutputParser()
         )
-        if use_cot:
-            chain = chain | RunnableLambda(_strip_think_tags)
 
         try:
-            response = chain.invoke(messages)
+            raw_response = chain.invoke(messages)
         except Exception:
             self.agent_logger.logger.exception("Failed to send message to LLM")
             return None
+
+        if use_cot:
+            response = _strip_think_tags(raw_response)
+            if raw_response != response:
+                self.agent_logger.logger.debug(["COT_THINK", raw_response])
+        else:
+            response = raw_response
 
         self.llm_message_history.append(human_message)
         self.llm_message_history.append(AIMessage(content=response))
