@@ -1608,9 +1608,6 @@ class Agent:
             self.agent_logger.logger.error("LLM is not initialized")
             return None
 
-        use_cot = request in (Request.TALK, Request.WHISPER)
-        if use_cot:
-            prompt += "\n\n発話の前に <think>〜</think> タグで思考過程を記述してから、タグの外に最終的な発話だけを出力してください。"
         human_message = HumanMessage(content=prompt)
         messages: list[BaseMessage] = []
         system_template = self._resolve_prompt("system", merge_default=True)
@@ -1619,23 +1616,21 @@ class Agent:
             messages.append(SystemMessage(content=system_content))
         messages.extend(self.llm_message_history)
         messages.append(human_message)
-        chain = (
-            self.llm_model.bind(temperature=self._get_temperature(request.lower())).with_retry(stop_after_attempt=3)
-            | StrOutputParser()
-        )
 
         try:
+            chain = (
+                self.llm_model.bind(
+                    temperature=self._get_temperature(request.lower()),
+                ).with_retry(stop_after_attempt=3)
+                | StrOutputParser()
+            )
             raw_response = chain.invoke(messages)
+            response = _strip_think_tags(raw_response)
+            if response != raw_response:
+                self.agent_logger.logger.debug(["COT_THINK", raw_response])
         except Exception:
             self.agent_logger.logger.exception("Failed to send message to LLM")
             return None
-
-        if use_cot:
-            response = _strip_think_tags(raw_response)
-            if raw_response != response:
-                self.agent_logger.logger.debug(["COT_THINK", raw_response])
-        else:
-            response = raw_response
 
         self.llm_message_history.append(human_message)
         self.llm_message_history.append(AIMessage(content=response))
