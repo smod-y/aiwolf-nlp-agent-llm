@@ -48,9 +48,9 @@ class Seer(Agent):
             target = self.info.divine_result.target
             result = self.info.divine_result.result
             if result == Species.WEREWOLF:
-                self.divine_results[target] = "黒(人狼)"
+                self.divine_results[target] = self.L("seer_black")
             else:
-                self.divine_results[target] = "白(人間)"
+                self.divine_results[target] = self.L("seer_white")
         super().daily_initialize()
 
     def _get_template_keys(self) -> dict[str, Any]:

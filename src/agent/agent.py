@@ -8,7 +8,6 @@ from __future__ import annotations
 import asyncio
 import os
 import random
-import re
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from time import sleep
@@ -18,7 +17,6 @@ from dotenv import load_dotenv
 from jinja2 import Template
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_core.output_parsers import StrOutputParser
-from langchain_core.runnables import RunnableLambda
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_ollama import ChatOllama
 from langchain_openai import ChatOpenAI
@@ -33,6 +31,7 @@ if TYPE_CHECKING:
 from aiwolf_nlp_common.packet import Info, Packet, Request, Role, Setting, Status, Talk
 
 from utils.agent_logger import AgentLogger
+from utils.labels import Labels, get_labels
 from utils.stoppable_thread import StoppableThread
 
 if TYPE_CHECKING:
@@ -40,6 +39,14 @@ if TYPE_CHECKING:
 
 P = ParamSpec("P")
 T = TypeVar("T")
+
+def _is_white(s: str) -> bool:
+    return "白" in s or "Innocent" in s
+
+
+def _is_black(s: str) -> bool:
+    return "黒" in s or "Werewolf" in s
+
 
 def _strip_think_tags(text: str) -> str:
     close_idx = text.rfind("</think>")
@@ -149,6 +156,7 @@ class Agent:
             role (Role): Role / 役職
         """
         self.config = config
+        self.L: Labels = get_labels(config)
         self.agent_name = name
         self.agent_logger = AgentLogger(config, name, game_id)
         self.request: Request | None = None
@@ -476,9 +484,9 @@ class Agent:
             black_count: dict[str, int] = {}
             for results in self.co_divine_map.values():
                 for target, result in results.items():
-                    if "白" in result:
+                    if _is_white(result):
                         white_count[target] = white_count.get(target, 0) + 1
-                    elif "黒" in result:
+                    elif _is_black(result):
                         black_count[target] = black_count.get(target, 0) + 1
             for player, w in white_count.items():
                 if black_count.get(player, 0) > 0:
@@ -502,15 +510,15 @@ class Agent:
                     if medium_color is None:
                         continue
                     # 白/黒のラベルが一致しなければ矛盾
-                    seer_white = "白" in seer_color
-                    medium_white = "白" in medium_color
+                    seer_white = _is_white(seer_color)
+                    medium_white = _is_white(medium_color)
                     if seer_white != medium_white:
                         if seer not in confirmed_fake_seers:
                             confirmed_fake_seers.append(seer)
                         break
             # ケース2: 占い CO 本人が追放され、霊能で人狼と判明している場合
             for seer in self.co_divine_map:
-                if "黒" in medium_results.get(seer, "") and seer not in confirmed_fake_seers:
+                if _is_black(medium_results.get(seer, "")) and seer not in confirmed_fake_seers:
                     confirmed_fake_seers.append(seer)
         # 確定真占い師: 占い CO のうち、確定偽占い師を除いて 1 人だけ残るならその 1 人（消去法）.
         # 計算コスト回避のため「黒判定 == 霊能黒判定」の直接判定ロジックは実装しない.
@@ -544,7 +552,7 @@ class Agent:
                 is_real_bodyguard = self.role == Role.BODYGUARD
                 # 確定真占い師から黒判定されている場合は、人狼の騎士騙りの可能性が高い
                 real_seer_black_judged = any(
-                    "黒" in self.co_divine_map.get(true_seer, {}).get(single_knight, "")
+                    _is_black(self.co_divine_map.get(true_seer, {}).get(single_knight, ""))
                     for true_seer in confirmed_true_seers
                 )
                 if (
@@ -619,7 +627,7 @@ class Agent:
         def _alive_marker(name: str) -> str:
             if self.info is None:
                 return ""
-            return "" if self.info.status_map.get(name) == Status.ALIVE else "(死亡)"
+            return "" if self.info.status_map.get(name) == Status.ALIVE else self.L("dead")
 
         # 占い CO 一覧の bullet 文字列を precompute（複数テンプレートで重複していた Jinja ループを排除）
         # actor/target 共に死亡時は "(死亡)" を付与して、LLM が死亡プレイヤーを行動対象に選ばないよう支援
@@ -644,10 +652,10 @@ class Agent:
                 if self_name not in results:
                     continue
                 result = results[self_name]
-                if "白" in result:
-                    my_judgments.append({"seer": seer, "color": "白"})
-                elif "黒" in result:
-                    my_judgments.append({"seer": seer, "color": "黒"})
+                if _is_white(result):
+                    my_judgments.append({"seer": seer, "color": self.L("color_white")})
+                elif _is_black(result):
+                    my_judgments.append({"seer": seer, "color": self.L("color_black")})
         # 霊能 CO 一覧の bullet 文字列を precompute
         medium_result_lines = "\n".join(
             f"- {medium}: " + ", ".join(f"{tgt}={res}" for tgt, res in results.items())
@@ -695,14 +703,14 @@ class Agent:
                 # （受けている状態で kakoi 誘導すると「同じ fake_seer の他の白を疑う=身内切り」と
                 #  村に即座に見抜かれるため、人狼側の kakoi 誘導は自粛する）
                 ww_white_judged_by_this_fake = (
-                    "白" in fake_seer_judgments.get(self_name_for_kakoi, "")
+                    _is_white(fake_seer_judgments.get(self_name_for_kakoi, ""))
                     or any(
-                        "白" in fake_seer_judgments.get(partner, "")
+                        _is_white(fake_seer_judgments.get(partner, ""))
                         for partner in ww_partners_for_kakoi
                     )
                 )
                 for target, color in fake_seer_judgments.items():
-                    if "白" not in color:
+                    if not _is_white(color):
                         continue
                     if self.info.status_map.get(target) != Status.ALIVE:
                         continue
@@ -734,11 +742,11 @@ class Agent:
                     if target not in all_co_holders:
                         kakoi_candidates_village.append((fake_seer, target))
         kakoi_lines_ww = "\n".join(
-            f"- {seer}{_alive_marker(seer)} が「{target}{_alive_marker(target)}」を白判定 → 囲い候補（黒塗り誘導の標的）"
+            self.L("kakoi_ww").format(seer=seer, sm=_alive_marker(seer), target=target, tm=_alive_marker(target))
             for seer, target in kakoi_candidates_ww
         )
         kakoi_lines_village = "\n".join(
-            f"- {seer}{_alive_marker(seer)} が「{target}{_alive_marker(target)}」を白判定 → 囲い候補（人狼を匿うための白の可能性）"
+            self.L("kakoi_village").format(seer=seer, sm=_alive_marker(seer), target=target, tm=_alive_marker(target))
             for seer, target in kakoi_candidates_village
         )
         # プレイヤーごとの統合インテル: 役職主張 + 受領占い結果 + グレー判定
@@ -757,33 +765,37 @@ class Agent:
                 roles: list[str] = []
                 if p in self.co_divine_map:
                     if p in confirmed_fake_seers:
-                        roles.append("狂人（偽占いCO）")
+                        roles.append(self.L("role_possessed_fake_seer"))
                     elif p == first_attacked_seer:
-                        roles.append("占い師（先に襲撃=真濃厚）")
+                        roles.append(self.L("role_seer_attacked"))
                     elif p in likely_fake_seers_via_attack:
-                        roles.append("占い師（対抗が先に襲撃された=偽濃厚）")
+                        roles.append(self.L("role_seer_likely_fake"))
                     else:
-                        roles.append("占い師")
+                        roles.append(self.L("role_seer"))
                 if p in self.medium_co_set or p in self.medium_result_map:
                     if p == confirmed_medium_player:
-                        roles.append("霊能者（確定=白扱い）")
+                        roles.append(self.L("role_medium_confirmed"))
                     else:
-                        roles.append("霊能者")
+                        roles.append(self.L("role_medium"))
                 if p in self.bodyguard_co_set:
                     if p == confirmed_knight_player:
-                        roles.append("騎士（確定=白扱い）")
+                        roles.append(self.L("role_bodyguard_confirmed"))
                     elif p == presumed_knight_player:
-                        roles.append("騎士（対抗無し・濃厚）")
+                        roles.append(self.L("role_bodyguard_likely"))
                     else:
-                        roles.append("騎士")
-                role_str = "、".join(roles) if roles else ""
+                        roles.append(self.L("role_bodyguard"))
+                sep = self.L("intel_separator")
+                role_str = sep.join(roles) if roles else ""
                 divines = incoming_divine.get(p, [])
                 divine_str = (
-                    "、".join(f"{s}より{c}" for s, c in divines) if divines else ""
+                    sep.join(self.L("intel_divine_item").format(seer=s, color=c) for s, c in divines) if divines else ""
                 )
-                gray_marker = " ← グレー" if not roles and not divines else ""
+                gray_marker = self.L("gray") if not roles and not divines else ""
                 intel_rows.append(
-                    f"- {p}{_alive_marker(p)}: 役職=[{role_str}], 占い受領=[{divine_str}]{gray_marker}"
+                    self.L("intel_row").format(
+                        player=p, marker=_alive_marker(p), role_str=role_str,
+                        divine_str=divine_str, gray_marker=gray_marker,
+                    )
                 )
             player_intel_lines = "\n".join(intel_rows)
         return {
@@ -953,14 +965,14 @@ class Agent:
                 if "support" not in stance:
                     continue
                 # ① supporter が supported を白出ししている → 自分が白と判定した相手を擁護
-                if "白" in self.co_divine_map.get(supporter, {}).get(supported, ""):
+                if _is_white(self.co_divine_map.get(supporter, {}).get(supported, "")):
                     consistent_supports.append(
-                        (supporter, supported, "白出しした相手を擁護（自然）"),
+                        (supporter, supported, self.L("support_gave_innocent")),
                     )
                 # ② supported が supporter を白出ししている → 白判定された側が擁護を返す
-                elif "白" in self.co_divine_map.get(supported, {}).get(supporter, ""):
+                elif _is_white(self.co_divine_map.get(supported, {}).get(supporter, "")):
                     consistent_supports.append(
-                        (supporter, supported, "白判定してくれた相手に擁護を返す（自然）"),
+                        (supporter, supported, self.L("support_received_innocent")),
                     )
 
         # 6. 陣営構図（alliance_blocks）: union-find で正の関係（support / 白判定）を連結
@@ -983,14 +995,14 @@ class Agent:
         for seer, results in self.co_divine_map.items():
             for partner in werewolf_partners:
                 partner_result = results.get(partner, "")
-                if "黒" in partner_result and seer not in partner_black_judged_by:
+                if _is_black(partner_result) and seer not in partner_black_judged_by:
                     partner_black_judged_by.append(seer)
-                if "白" in partner_result and seer not in partner_white_judged_by:
+                if _is_white(partner_result) and seer not in partner_white_judged_by:
                     partner_white_judged_by.append(seer)
         my_black_judged_by: list[str] = []
         if self_name:
             for seer, results in self.co_divine_map.items():
-                if "黒" in results.get(self_name, ""):
+                if _is_black(results.get(self_name, "")):
                     my_black_judged_by.append(seer)
 
         return {
@@ -1045,7 +1057,7 @@ class Agent:
                     union(actor, target)
         for seer, results in self.co_divine_map.items():
             for target, result in results.items():
-                if "白" in result:
+                if _is_white(result):
                     union(seer, target)
 
         groups: dict[str, list[str]] = {}
@@ -1053,17 +1065,16 @@ class Agent:
             groups.setdefault(find(p), []).append(p)
         return [sorted(g) for g in groups.values() if len(g) >= 2]
 
-    @staticmethod
-    def _normalize_co_result(result: Any) -> str | None:  # noqa: ANN401
-        """Normalize a divine result string to '白(人間)' / '黒(人狼)' or None."""
+    def _normalize_co_result(self, result: Any) -> str | None:  # noqa: ANN401
+        """Normalize a divine result string to white/black label or None."""
         if not result:
             return None
         s = str(result)
         s_upper = s.upper()
         if "黒" in s or "WEREWOLF" in s_upper or "BLACK" in s_upper:
-            return "黒(人狼)"
-        if "白" in s or "HUMAN" in s_upper or "WHITE" in s_upper:
-            return "白(人間)"
+            return self.L("black")
+        if "白" in s or "HUMAN" in s_upper or "WHITE" in s_upper or "INNOCENT" in s_upper:
+            return self.L("white")
         return None
 
     def _apply_co_extraction_items(self, items: list[Any]) -> None:
@@ -1140,12 +1151,12 @@ class Agent:
                 for seer, results in self.co_divine_map.items()
             )
         else:
-            existing_map_text = "(まだなし)"
+            existing_map_text = self.L("none_yet")
 
         # 既に霊能者 CO 済みのプレイヤー名を列挙 → これらの発言は霊能結果なので占い CO 抽出対象外
         known_mediums = self.medium_co_set | set(self.medium_result_map.keys())
         known_mediums_text = (
-            "、".join(sorted(known_mediums)) if known_mediums else "(なし)"
+            self.L("intel_separator").join(sorted(known_mediums)) if known_mediums else self.L("none")
         )
 
         rendered = (
@@ -1203,7 +1214,7 @@ class Agent:
                 for medium, results in self.medium_result_map.items()
             )
         else:
-            existing_map_text = "(まだなし)"
+            existing_map_text = self.L("none_yet")
 
         rendered = (
             Template(template)
@@ -1263,7 +1274,8 @@ class Agent:
 
         talks_text = "\n".join(f"Day{t.day} {t.agent}: {t.text}" for t in new_talks)
         existing_text = (
-            "、".join(sorted(self.bodyguard_co_set)) if self.bodyguard_co_set else "(まだなし)"
+            self.L("intel_separator").join(sorted(self.bodyguard_co_set))
+            if self.bodyguard_co_set else self.L("none_yet")
         )
 
         rendered = (
@@ -1325,7 +1337,7 @@ class Agent:
 
         talks_text = "\n".join(f"Day{t.day} {t.agent}: {t.text}" for t in new_talks)
         existing_text = (
-            "、".join(sorted(self.medium_co_set)) if self.medium_co_set else "(まだなし)"
+            self.L("intel_separator").join(sorted(self.medium_co_set)) if self.medium_co_set else self.L("none_yet")
         )
 
         rendered = (
@@ -1445,7 +1457,7 @@ class Agent:
                 for actor, lines in relevant_map.items()
             )
         else:
-            existing_map_text = "(まだなし)"
+            existing_map_text = self.L("none_yet")
 
         rendered = (
             Template(template)
