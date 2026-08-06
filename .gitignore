@@ -272,4 +272,16 @@ $RECYCLE.BIN/
 
 # End of https://www.toptal.com/developers/gitignore/api/visualstudiocode,macos,windows,python,venv
 
-config/config.yml
+config/*
+!config/.env.example
+!config/config.en.yml.example
+!config/config.jp.yml.example
+
+# conpe_results
+jsai2026_results/
+
+# docs
+docs/
+
+# claude
+CLAUDE,md
