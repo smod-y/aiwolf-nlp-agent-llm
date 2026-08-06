@@ -6,8 +6,10 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import random
+import re
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from time import sleep
@@ -46,23 +48,6 @@ def _is_white(s: str) -> bool:
 
 def _is_black(s: str) -> bool:
     return "黒" in s or "Werewolf" in s
-
-
-def _strip_think_tags(text: str) -> str:
-    close_idx = text.rfind("</think>")
-    if close_idx != -1:
-        return text[close_idx + len("</think>"):].strip()
-    open_idx = text.rfind("<think>")
-    if open_idx != -1:
-        return text[open_idx + len("<think>"):].strip()
-    return text.strip()
-
-
-class ActionDecision(BaseModel):
-    """Structured output schema for vote/divine/guard/attack actions."""
-
-    reasoning: str = Field(description="判断の根拠を段階的に記述")
-    target: str = Field(description="対象プレイヤー名")
 
 
 class CoExtractionItem(BaseModel):
@@ -223,6 +208,16 @@ class Agent:
         self.attacked_players: list[str] = []
 
         load_dotenv(Path(__file__).parent.joinpath("./../../config/.env"))
+
+    @property
+    def _werewolf_total(self) -> int:
+        """ゲームのプレイヤー数から人狼の総数を返す."""
+        player_num = int(self.config["agent"]["num"])
+        if player_num <= 5:  # noqa: PLR2004
+            return 1
+        if player_num <= 9:  # noqa: PLR2004
+            return 2
+        return 3
 
     @staticmethod
     def timeout(func: Callable[P, T]) -> Callable[P, T]:
@@ -441,13 +436,7 @@ class Agent:
             dict[str, Any]: Template keys / テンプレートキー
         """
         player_num = int(self.config["agent"]["num"])
-        # 役職割当の想定: 5人=人狼1, 9人=人狼2, 13人=人狼3
-        if player_num <= 5:
-            werewolf_total = 1
-        elif player_num <= 9:
-            werewolf_total = 2
-        else:
-            werewolf_total = 3
+        werewolf_total = self._werewolf_total
         alive_count = 0
         if self.info is not None:
             alive_count = sum(
@@ -827,6 +816,7 @@ class Agent:
             "confirmed_medium_player": confirmed_medium_player,
             "attacked_players": self.attacked_players,
             "first_attacked_seer": first_attacked_seer,
+            "first_seer_attack_day": self.first_seer_attack_day,
             "likely_real_seers_via_attack": likely_real_seers_via_attack,
             "likely_fake_seers_via_attack": likely_fake_seers_via_attack,
             "kakoi_candidates_ww": kakoi_candidates_ww,
@@ -841,6 +831,7 @@ class Agent:
             "line_map": self.line_map,
             "my_lines": self.line_map.get(self.info.agent, {}) if self.info else {},
             "line_flip_count": self.line_flip_count,
+            "alive_agent_list": self.get_alive_agents(),
             **line_derived,
         }
 
@@ -1618,20 +1609,15 @@ class Agent:
         messages.append(human_message)
 
         try:
-            chain = (
-                self.llm_model.bind(
-                    temperature=self._get_temperature(request.lower()),
-                ).with_retry(stop_after_attempt=3)
+            response = (
+                self.llm_model.bind(temperature=self._get_temperature(request.lower())).with_retry(stop_after_attempt=3)
                 | StrOutputParser()
-            )
-            raw_response = chain.invoke(messages)
-            response = _strip_think_tags(raw_response)
-            if response != raw_response:
-                self.agent_logger.logger.debug(["COT_THINK", raw_response])
+            ).invoke(messages)
         except Exception:
             self.agent_logger.logger.exception("Failed to send message to LLM")
             return None
 
+        response = re.sub(r"<think>.*?</think>\s*", "", response, flags=re.DOTALL)
         self.llm_message_history.append(human_message)
         self.llm_message_history.append(AIMessage(content=response))
         self.agent_logger.logger.info(["LLM", prompt, response])
@@ -1754,64 +1740,42 @@ class Agent:
         self._refresh_extractions()
         self._send_message_to_llm(self.request)
 
-    def _validate_alive_target(self, response: str | None) -> str:
+    def _extract_target_from_response(self, response: str | None) -> str | None:
+        """Extract target player name from LLM response.
+
+        JSON 形式 ({"target": "..."}) とプレーンテキスト両方に対応する.
+        """
+        if not response:
+            return None
+        text = response.strip()
+        # JSON 形式の応答から target フィールドを抽出
+        try:
+            parsed: Any = json.loads(text)
+            if isinstance(parsed, dict) and "target" in parsed:
+                return str(parsed["target"]).strip() or None  # pyright: ignore[reportUnknownArgumentType]
+        except (json.JSONDecodeError, ValueError):
+            pass
+        # JSON ブロックが文中に埋もれている場合（例: "Based on my analysis, {"reasoning":...}"）
+        json_match = re.search(r'\{[^{}]*"target"\s*:\s*"([^"]+)"[^{}]*\}', text)
+        if json_match:
+            return json_match.group(1).strip() or None
+        return text
+
+    def _validate_alive_target(self, response: str | None, *, exclude: list[str] | None = None) -> str:
         """Validate LLM response is a name of an alive agent; fallback to random alive.
 
         LLM の応答が生存しているエージェント名であることを検証し、無効ならランダムな生存者を返す.
         死亡プレイヤー名・空文字・無効文字列を含む応答に対する安全網.
+        exclude に指定されたエージェントはフォールバック候補から除外する.
         """
         alive = self.get_alive_agents()
-        if response and response.strip() in alive:
-            return response.strip()
-        return random.choice(alive)  # noqa: S311
-
-    def _send_action_to_llm(self, request: Request) -> str | None:
-        """Send action request to LLM with structured output (CoT reasoning + target).
-
-        ActionDecision スキーマで reasoning と target を JSON 出力させ、
-        reasoning をログに記録し target を返す.
-        """
-        prompt = self._resolve_prompt(request.lower())
-        if prompt is None:
-            return None
-        if float(self.config["llm"]["sleep_time"]) > 0:
-            sleep(float(self.config["llm"]["sleep_time"]))
-        self._compress_history()
-        key = self._get_template_keys()
-        template: Template = Template(prompt)
-        prompt = template.render(**key).strip()
-        if self.llm_model is None:
-            self.agent_logger.logger.error("LLM is not initialized")
-            return None
-
-        human_message = HumanMessage(content=prompt)
-        messages: list[BaseMessage] = []
-        system_template = self._resolve_prompt("system", merge_default=True)
-        if system_template:
-            system_content = Template(system_template).render(**key).strip()
-            messages.append(SystemMessage(content=system_content))
-        messages.extend(self.llm_message_history)
-        messages.append(human_message)
-
-        try:
-            structured_llm = self.llm_model.with_structured_output(ActionDecision, method="json_mode")  # pyright: ignore[reportUnknownMemberType]
-            result = cast(
-                "ActionDecision | None",
-                structured_llm.bind(temperature=self._get_temperature(request.lower())).with_retry(stop_after_attempt=3).invoke(messages),
-            )
-        except Exception:
-            self.agent_logger.logger.exception("Failed to send action to LLM")
-            return None
-
-        if result is None:
-            return None
-
-        self.llm_message_history.append(human_message)
-        self.llm_message_history.append(AIMessage(content=result.target))
-        self.agent_logger.logger.info(
-            ["LLM_ACTION", prompt, {"reasoning": result.reasoning, "target": result.target}],
-        )
-        return result.target
+        target = self._extract_target_from_response(response)
+        if target and target in alive:
+            return target
+        candidates = [a for a in alive if a not in (exclude or [])]
+        if not candidates:
+            candidates = alive
+        return random.choice(candidates)  # noqa: S311
 
     def divine(self) -> str:
         """Return response to divine request.
@@ -1822,7 +1786,7 @@ class Agent:
             str: Agent name to divine / 占い対象のエージェント名
         """
         self._refresh_extractions()
-        return self._validate_alive_target(self._send_action_to_llm(Request.DIVINE))
+        return self._validate_alive_target(self._send_message_to_llm(self.request))
 
     def guard(self) -> str:
         """Return response to guard request.
@@ -1833,7 +1797,7 @@ class Agent:
             str: Agent name to guard / 護衛対象のエージェント名
         """
         self._refresh_extractions()
-        return self._validate_alive_target(self._send_action_to_llm(Request.GUARD))
+        return self._validate_alive_target(self._send_message_to_llm(self.request))
 
     def vote(self) -> str:
         """Return response to vote request.
@@ -1844,7 +1808,7 @@ class Agent:
             str: Agent name to vote / 投票対象のエージェント名
         """
         self._refresh_extractions()
-        return self._validate_alive_target(self._send_action_to_llm(Request.VOTE))
+        return self._validate_alive_target(self._send_message_to_llm(self.request))
 
     def attack(self) -> str:
         """Return response to attack request.
@@ -1855,7 +1819,13 @@ class Agent:
             str: Agent name to attack / 襲撃対象のエージェント名
         """
         self._refresh_extractions()
-        return self._validate_alive_target(self._send_action_to_llm(Request.ATTACK))
+        # 自分と相方人狼をフォールバック候補から除外
+        exclude = [self.info.agent] if self.info else []
+        if self.info and self.info.role_map:
+            for agent, r in self.info.role_map.items():
+                if r == Role.WEREWOLF and agent != (self.info.agent if self.info else ""):
+                    exclude.append(agent)
+        return self._validate_alive_target(self._send_message_to_llm(self.request), exclude=exclude)
 
     def finish(self) -> None:
         """Perform processing for game finish request.
