@@ -37,6 +37,7 @@ class Seer(Agent):
         """
         super().__init__(config, name, game_id, Role.SEER)
         self.divine_results: dict[str, str] = {}
+        self.found_werewolf_today: str | None = None
 
     def daily_initialize(self) -> None:
         """Perform processing for daily initialization request.
@@ -44,11 +45,13 @@ class Seer(Agent):
         昼開始リクエストに対する処理を行う.
         first-person の占い結果を蓄積した上で, 親クラスで CO 抽出と LLM 送信を行う.
         """
+        self.found_werewolf_today = None
         if self.info and self.info.divine_result:
             target = self.info.divine_result.target
             result = self.info.divine_result.result
             if result == Species.WEREWOLF:
                 self.divine_results[target] = self.L("seer_black")
+                self.found_werewolf_today = target
             else:
                 self.divine_results[target] = self.L("seer_white")
         super().daily_initialize()
@@ -63,6 +66,7 @@ class Seer(Agent):
         """
         keys = super()._get_template_keys()
         keys["divine_results"] = self.divine_results
+        keys["found_werewolf_today"] = self.found_werewolf_today
         return keys
 
     def talk(self) -> str:
