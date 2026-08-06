@@ -9,8 +9,9 @@
 をフォークし、独自のエージェントとして構築・改修したものです。
 
 >[!NOTE]
+
 >本リポジトリはフォーク元のサンプル実装そのものではありません。
->独自に追加・変更した設定、プロンプト、エージェントロジックなどが含まれています。
+>独自に追加・変更した設定、プロンプト、エージェントロジックなどが含まれています
 
 ## 仕様
 
@@ -96,8 +97,8 @@ chmod u+x ./aiwolf-nlp-server-linux-amd64
 
 ```bash
 ./server/aiwolf-nlp-server-linux-amd64 -c ./default_5.yml # 5人ゲームの場合
-./aiwolf-nlp-server-linux-amd64 -c ./default_9.yml # 9人ゲームの場合
-./aiwolf-nlp-server-linux-amd64 -c ./freeform.yml # チャット形式の場合
+./server/aiwolf-nlp-server-linux-amd64 -c ./default_9.yml # 9人ゲームの場合
+./server/aiwolf-nlp-server-linux-amd64 -c ./freeform.yml # チャット形式の場合
 ```
 
 エージェントの起動:
