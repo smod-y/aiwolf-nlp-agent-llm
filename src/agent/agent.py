@@ -43,7 +43,7 @@ P = ParamSpec("P")
 T = TypeVar("T")
 
 def _is_white(s: str) -> bool:
-    return "白" in s or "Innocent" in s
+    return "白" in s or "Innocent" in s or "Human" in s
 
 
 def _is_black(s: str) -> bool:
