@@ -210,9 +210,16 @@ class Agent:
         load_dotenv(Path(__file__).parent.joinpath("./../../config/.env"))
 
     @property
+    def _player_num(self) -> int:
+        """ゲームの実プレイヤー数を返す."""
+        if self.info is not None:
+            return len(self.info.status_map)
+        return int(self.config["agent"]["num"])
+
+    @property
     def _werewolf_total(self) -> int:
         """ゲームのプレイヤー数から人狼の総数を返す."""
-        player_num = int(self.config["agent"]["num"])
+        player_num = self._player_num
         if player_num <= 5:  # noqa: PLR2004
             return 1
         if player_num <= 9:  # noqa: PLR2004
@@ -435,7 +442,7 @@ class Agent:
         Returns:
             dict[str, Any]: Template keys / テンプレートキー
         """
-        player_num = int(self.config["agent"]["num"])
+        player_num = self._player_num
         werewolf_total = self._werewolf_total
         alive_count = 0
         if self.info is not None:
@@ -1520,9 +1527,9 @@ class Agent:
         compression_configs: dict[int | str, Any] | None = self.config["llm"].get("history_compression")
         if compression_configs is None:
             return None
-        agent_num = int(self.config["agent"]["num"])
-        config: dict[str, Any] | None = compression_configs.get(agent_num) or compression_configs.get(
-            str(agent_num),
+        player_num = self._player_num
+        config: dict[str, Any] | None = compression_configs.get(player_num) or compression_configs.get(
+            str(player_num),
         )
         if config is None or not config.get("enabled", False):
             return None

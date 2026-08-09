@@ -72,7 +72,7 @@ class Werewolf(Agent):
         Day 1+: Day 0 の whisper 履歴から相方がCOを主張したかを判定。
         相方がCO宣言していたら譲り、そうでなければ自分がCO。
         """
-        player_num = int(self.config["agent"]["num"])
+        player_num = self._player_num
         if player_num < _MIN_PLAYERS_FOR_FAKE_CO or self.info is None or not self.info.role_map:
             self.ww_seer_co = False
             self.ww_want_co = False
