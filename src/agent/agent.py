@@ -1766,13 +1766,14 @@ class Agent:
 
         LLM の応答が生存しているエージェント名であることを検証し、無効ならランダムな生存者を返す.
         死亡プレイヤー名・空文字・無効文字列を含む応答に対する安全網.
-        exclude に指定されたエージェントはフォールバック候補から除外する.
+        exclude に指定されたエージェントは LLM 応答・フォールバック両方で除外する.
         """
         alive = self.get_alive_agents()
+        excluded = set(exclude or [])
         target = self._extract_target_from_response(response)
-        if target and target in alive:
+        if target and target in alive and target not in excluded:
             return target
-        candidates = [a for a in alive if a not in (exclude or [])]
+        candidates = [a for a in alive if a not in excluded]
         if not candidates:
             candidates = alive
         return random.choice(candidates)  # noqa: S311
@@ -1786,7 +1787,8 @@ class Agent:
             str: Agent name to divine / 占い対象のエージェント名
         """
         self._refresh_extractions()
-        return self._validate_alive_target(self._send_message_to_llm(self.request))
+        exclude = [self.info.agent] if self.info else []
+        return self._validate_alive_target(self._send_message_to_llm(self.request), exclude=exclude)
 
     def guard(self) -> str:
         """Return response to guard request.
@@ -1797,7 +1799,8 @@ class Agent:
             str: Agent name to guard / 護衛対象のエージェント名
         """
         self._refresh_extractions()
-        return self._validate_alive_target(self._send_message_to_llm(self.request))
+        exclude = [self.info.agent] if self.info else []
+        return self._validate_alive_target(self._send_message_to_llm(self.request), exclude=exclude)
 
     def vote(self) -> str:
         """Return response to vote request.
@@ -1808,7 +1811,8 @@ class Agent:
             str: Agent name to vote / 投票対象のエージェント名
         """
         self._refresh_extractions()
-        return self._validate_alive_target(self._send_message_to_llm(self.request))
+        exclude = [self.info.agent] if self.info else []
+        return self._validate_alive_target(self._send_message_to_llm(self.request), exclude=exclude)
 
     def attack(self) -> str:
         """Return response to attack request.

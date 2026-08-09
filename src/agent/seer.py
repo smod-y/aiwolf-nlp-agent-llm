@@ -83,11 +83,16 @@ class Seer(Agent):
         """Return response to divine request.
 
         占いリクエストに対する応答を返す.
+        フォールバック時は自分と既占い済み対象を除外する.
 
         Returns:
             str: Agent name to divine / 占い対象のエージェント名
         """
-        return super().divine()
+        self._refresh_extractions()
+        exclude = list(self.divine_results.keys())
+        if self.info:
+            exclude.append(self.info.agent)
+        return self._validate_alive_target(self._send_message_to_llm(self.request), exclude=exclude)
 
     def vote(self) -> str:
         """Return response to vote request.
