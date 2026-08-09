@@ -10,7 +10,7 @@ from typing import Any
 
 from aiwolf_nlp_common.packet import Role
 
-from agent.agent import Agent
+from agent.agent import Agent, _is_black, _is_white
 
 
 class Possessed(Agent):
@@ -65,10 +65,10 @@ class Possessed(Agent):
                 my_judgment = my_results.get(target)
                 if my_judgment is None:
                     continue
-                my_black = "黒" in my_judgment or "人狼" in my_judgment
-                my_white = "白" in my_judgment or "人間" in my_judgment
-                medium_white = "白" in medium_judgment or "人間" in medium_judgment
-                medium_black = "黒" in medium_judgment or "人狼" in medium_judgment
+                my_black = _is_black(my_judgment)
+                my_white = _is_white(my_judgment)
+                medium_white = _is_white(medium_judgment)
+                medium_black = _is_black(medium_judgment)
                 if (my_black and medium_white) or (my_white and medium_black):
                     self.possessed_exposed = True
                     return
@@ -88,10 +88,7 @@ class Possessed(Agent):
         self.possessed_black_target = None
 
         my_results = self.co_divine_map.get(self.info.agent, {})
-        co_map_blacks = sum(
-            1 for r in my_results.values()
-            if "黒" in r or "Werewolf" in r
-        )
+        co_map_blacks = sum(1 for r in my_results.values() if _is_black(r))
         total_blacks = max(len(self.possessed_black_history), co_map_blacks)
         if total_blacks >= self._werewolf_total:
             return
@@ -101,7 +98,7 @@ class Possessed(Agent):
         my_white_targets = {
             target
             for target, judgment in my_results.items()
-            if "白" in judgment or "人間" in judgment
+            if _is_white(judgment)
         }
 
         alive = self.get_alive_agents()
@@ -134,10 +131,7 @@ class Possessed(Agent):
         keys["possessed_black_target"] = self.possessed_black_target
         keys["possessed_exposed"] = self.possessed_exposed
         my_results = self.co_divine_map.get(self.info.agent, {}) if self.info else {}
-        co_map_blacks = sum(
-            1 for r in my_results.values()
-            if "黒" in r or "Werewolf" in r
-        )
+        co_map_blacks = sum(1 for r in my_results.values() if _is_black(r))
         keys["possessed_black_count"] = max(len(self.possessed_black_history), co_map_blacks)
         return keys
 
