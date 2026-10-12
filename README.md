@@ -40,6 +40,10 @@ Go 製ゲームサーバ [`aiwolf-nlp-server`](https://github.com/aiwolfdial/aiw
 
 ## 環境構築
 
+> [!NOTE]
+> 本リポジトリは、設定YAMLを公開していないため、単体では実行できません。
+> 以下は、フォーク元の[サンプルエージェント](https://github.com/aiwolfdial/aiwolf-nlp-agent-llm)を用いた環境構築手順です。
+
 > [!IMPORTANT]
 > Python 3.11以上が必要です。
 

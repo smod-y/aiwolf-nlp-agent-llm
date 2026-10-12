@@ -39,6 +39,10 @@ An LLM-based agent that connects to the Go game server [`aiwolf-nlp-server`](htt
 
 ## Environment Setup
 
+> [!NOTE]
+> This repository does not include the configuration YAML files, so it cannot be run on its own.
+> The following setup instructions use the original [sample agent](https://github.com/aiwolfdial/aiwolf-nlp-agent-llm) from which this repository was forked.
+
 > [!IMPORTANT]
 > Python 3.11 or higher is required.
 
